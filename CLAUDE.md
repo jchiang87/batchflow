@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Installation
 
 ```bash
-pip install -e ".[dev]"           # core + test dependencies
+pip install -e ".[dev]"           # core + test dependencies (includes htcondor)
 pip install -e ".[dev,webhook]"   # add aiohttp for WebhookTransport
 pip install -e ".[dev,postgres]"  # add asyncpg for PostgresStateStore
 pip install -e ".[dev,inotify]"   # add watchfiles for InotifyWakeStrategy
@@ -31,7 +31,7 @@ python -m pytest tests/ -k "test_simple_linear"   # single test by name
 
 The runner never polls graph state on a timer. Instead:
 
-1. `HTCondorMonitor` wakes on `TimerWakeStrategy` (or `InotifyWakeStrategy` when available), queries `condor_q`, and publishes `JobEvent` objects to the `EventBus`.
+1. `HTCondorMonitor` wakes on `TimerWakeStrategy` (or `InotifyWakeStrategy` when available), queries the schedd via the `htcondor` Python bindings, and publishes `JobEvent` objects to the `EventBus`.
 2. The `EventBus` fans each event out to per-subscriber `asyncio.Queue` instances — the runner, state store, and agent handler each get their own queue, so a slow agent webhook never stalls the scheduler.
 3. `WorkflowRunner._scheduler_loop` consumes its queue and transitions graph state. After each `NODE_COMPLETE` it calls `_submit_ready_nodes()`, which queries `WorkflowGraph.ready_nodes()` to find newly-unblocked nodes.
 
@@ -61,6 +61,10 @@ Use `stall_timeout=N` in tests to make the runner return `RunOutcome.STALLED` af
 | Notifications | `StdoutTransport` | `WebhookTransport`, `CallbackTransport` |
 
 Swap any backend by passing a different instance to `WorkflowRunner` or `AgentHandler`.
+
+### Multi-schedd support
+
+The cluster has one HTCondor schedd per interactive node (e.g. `sdfiana011`–`sdfiana033`). `BpsBackend.submit()` captures the submission schedd's FQDN from `htcondor.Schedd().location.address` and stores it in `PipelineNode.schedd_name`. `HTCondorMonitor` uses `htcondor.Collector().locate()` to reconnect to the correct schedd, so the agent can run on any node regardless of where `bps submit` was called. `schedd_name` is persisted in the `StateStore` so resume works correctly after restart.
 
 ## Adding a New Pipeline Node
 
@@ -109,3 +113,7 @@ batchflow intervene abort  <node_id>
 **Why SQLite now, Postgres later?** SQLite is zero-config for single-user use. `StateStore` is an ABC; switching to `PostgresStateStore` requires only changing one constructor argument.
 
 **Why is `stall_timeout` a constructor parameter, not a class default?** Production runs should never time out waiting for agent intervention. Tests need deterministic completion. Making it explicit prevents accidental timeout in production.
+
+**Why htcondor Python bindings instead of subprocess?** The `htcondor` package provides a typed API with proper exception types (`htcondor.HTCondorException`), no JSON parsing, and — critically — `htcondor.Collector().locate()` enables connecting to a named schedd on any node. The subprocess approach only worked when the agent ran on the same node as the submission.
+
+**Why store `schedd_name` on `PipelineNode`?** The schedd is determined at submit time (when we know which node we're on). Capturing it then and persisting it with the graph state means the monitor always reconnects to the right schedd, even after a resume on a different node.
