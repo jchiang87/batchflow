@@ -69,6 +69,7 @@ class PipelineNode:
     state:          NodeState = field(default=NodeState.PENDING, init=False)
     restart_count:  int       = field(default=0, init=False)
     submit_id:      str | None = field(default=None, init=False)  # HTCondor cluster id
+    schedd_name:    str | None = field(default=None, init=False)  # FQDN of submission schedd
 
     def __post_init__(self):
         if not re.match(r'^[A-Za-z0-9_\-]+$', self.node_id):

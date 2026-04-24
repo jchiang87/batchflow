@@ -355,10 +355,11 @@ class InterventionActions:
         else:
             # Re-submit from scratch.
             overrides = {**node.bps_overrides, **(bps_overrides or {})}
-            cluster_id = await self._backend.submit(
+            result = await self._backend.submit(
                 node.bps_yaml, self._bps_dir, overrides=overrides or None
             )
-            node.submit_id = cluster_id
+            node.submit_id   = result.cluster_id
+            node.schedd_name = result.schedd_name
 
         node.state = NodeState.SUBMITTED
         event = JobEvent(
@@ -443,16 +444,17 @@ class InterventionActions:
         if node.submit_id:
             await self._backend.remove(node.submit_id)
         node.bps_overrides.update(bps_overrides)
-        cluster_id = await self._backend.submit(
+        result = await self._backend.submit(
             node.bps_yaml, self._bps_dir, overrides=node.bps_overrides
         )
-        node.submit_id = cluster_id
+        node.submit_id   = result.cluster_id
+        node.schedd_name = result.schedd_name
         node.state = NodeState.SUBMITTED
         event = JobEvent(
             event_type  = EventType.INTERVENTION_MODIFY,
             workflow_id = self._graph.workflow_id,
             node_id     = node_id,
-            cluster_id  = cluster_id,
+            cluster_id  = result.cluster_id,
             actor       = actor,
             reason      = reason,
             extra       = {"bps_overrides": bps_overrides},

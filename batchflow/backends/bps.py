@@ -11,13 +11,35 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import subprocess
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Submission result
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SubmissionResult:
+    """
+    Returned by SubmissionBackend.submit().
+
+    Attributes
+    ----------
+    cluster_id : str
+        The HTCondor cluster ID, e.g. ``"12345"``.
+    schedd_name : str
+        FQDN of the schedd that accepted the submission (e.g.
+        ``"sdfiana032.sdf.slac.stanford.edu"``).  Empty string when
+        the schedd name could not be determined.
+    """
+    cluster_id:  str
+    schedd_name: str
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +48,7 @@ log = logging.getLogger(__name__)
 
 class SubmissionBackend(ABC):
     """
-    Submits a single pipeline node and returns the HTCondor cluster ID.
+    Submits a single pipeline node and returns a SubmissionResult.
     """
 
     @abstractmethod
@@ -36,7 +58,7 @@ class SubmissionBackend(ABC):
         bps_dir: Path,
         overrides: dict[str, str] | None = None,
         log_dir: Path | None = None,
-    ) -> str:
+    ) -> SubmissionResult:
         """
         Submit the pipeline described by *bps_yaml*.
 
@@ -54,8 +76,8 @@ class SubmissionBackend(ABC):
 
         Returns
         -------
-        str
-            HTCondor cluster ID, e.g. ``"12345"``.
+        SubmissionResult
+            Dataclass with cluster_id and schedd_name.
         """
 
     @abstractmethod
@@ -88,7 +110,7 @@ class BpsBackend(SubmissionBackend):
         bps_dir: Path,
         overrides: dict[str, str] | None = None,
         log_dir: Path | None = None,
-    ) -> str:
+    ) -> SubmissionResult:
         yaml_path = bps_dir / bps_yaml
         if not yaml_path.exists():
             raise FileNotFoundError(f"BPS YAML not found: {yaml_path}")
@@ -117,8 +139,20 @@ class BpsBackend(SubmissionBackend):
             )
 
         cluster_id = self._parse_cluster_id(stdout)
-        log.info("Submitted %s → cluster %s", bps_yaml, cluster_id)
-        return cluster_id
+
+        # Capture the local schedd FQDN so the monitor can reconnect to it
+        # when running on a different node.  The FQDN lives in the alias
+        # field of the DaemonLocation address string.
+        try:
+            import htcondor
+            m = re.search(r'alias=([^>&]+)', htcondor.Schedd().location.address)
+            schedd_name = m.group(1) if m else ""
+        except Exception:
+            schedd_name = ""
+
+        log.info("Submitted %s → cluster %s on schedd %s",
+                 bps_yaml, cluster_id, schedd_name)
+        return SubmissionResult(cluster_id=cluster_id, schedd_name=schedd_name)
 
     @staticmethod
     def _run_bps(cmd: list[str]) -> tuple[str, str]:
@@ -192,17 +226,18 @@ class MockBackend(SubmissionBackend):
         bps_dir: Path,
         overrides: dict[str, str] | None = None,
         log_dir: Path | None = None,
-    ) -> str:
+    ) -> SubmissionResult:
         cluster_id = str(self._next_id)
         self._next_id += 1
         record = {
-            "cluster_id": cluster_id,
-            "bps_yaml": bps_yaml,
-            "overrides": overrides or {},
+            "cluster_id":  cluster_id,
+            "schedd_name": "mock-schedd",
+            "bps_yaml":    bps_yaml,
+            "overrides":   overrides or {},
         }
         self.submitted.append(record)
         log.info("MockBackend: submit %s → cluster %s", bps_yaml, cluster_id)
-        return cluster_id
+        return SubmissionResult(cluster_id=cluster_id, schedd_name="mock-schedd")
 
     async def release_held(self, cluster_id: str) -> None:
         log.info("MockBackend: release_held %s", cluster_id)

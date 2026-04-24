@@ -275,6 +275,7 @@ def _serialize_graph(graph: WorkflowGraph) -> str:
                 "state":         n.state.value,
                 "restart_count": n.restart_count,
                 "submit_id":     n.submit_id,
+                "schedd_name":   n.schedd_name,
             }
             for n in graph.nodes
         ],
@@ -297,6 +298,7 @@ def _deserialize_graph(json_str: str) -> WorkflowGraph:
         node.state         = NodeState(nd["state"])
         node.restart_count = nd["restart_count"]
         node.submit_id     = nd["submit_id"]
+        node.schedd_name   = nd.get("schedd_name")
         graph.add_node(node)
     return graph
 

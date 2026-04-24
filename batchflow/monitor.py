@@ -7,7 +7,7 @@ whenever a job's state changes.
 
 Wake strategies
 ---------------
-TimerWakeStrategy   — sleeps for a fixed interval, then queries condor_q.
+TimerWakeStrategy   — sleeps for a fixed interval, then queries the schedd.
                       Used now; works on any filesystem.
 InotifyWakeStrategy — wakes immediately when the DAGMan event log is
                       written.  Suitable once inotify is available on
@@ -20,9 +20,8 @@ is completely unaware of which one is active.
 from __future__ import annotations
 
 import asyncio
-import json
+import functools
 import logging
-import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -64,13 +63,13 @@ _STATUS_TO_EVENT: dict[int, EventType] = {
 
 class WakeStrategy(ABC):
     """
-    Controls *when* the monitor wakes to query condor_q.
+    Controls *when* the monitor wakes to query the schedd.
     Implementations yield once per desired wake cycle.
     """
 
     @abstractmethod
     async def wake_cycles(self) -> AsyncIterator[None]:
-        """Async generator; yield to trigger a condor_q query."""
+        """Async generator; yield to trigger a schedd query."""
         ...  # pragma: no cover
         yield  # make it a generator for type checkers
 
@@ -82,8 +81,8 @@ class TimerWakeStrategy(WakeStrategy):
     Parameters
     ----------
     interval : float
-        Seconds between condor_q polls.  Default 60 s is a reasonable
-        balance between freshness and condor_q load for multi-day runs.
+        Seconds between schedd polls.  Default 60 s is a reasonable
+        balance between freshness and schedd load for multi-day runs.
     """
 
     def __init__(self, interval: float = 60.0) -> None:
@@ -143,46 +142,72 @@ class _CondorJobSummary:
     proc_ids:     list[str]   # list of "cluster.proc" strings
 
 
-def _query_condor_q(cluster_id: str) -> list[_CondorJobSummary]:
+def _get_schedd(htcondor_mod, schedd_name: str | None):
     """
-    Run ``condor_q -json <cluster_id>`` synchronously.
-    Returns one summary per proc in the cluster.
-    Raises subprocess.CalledProcessError on condor_q failure.
+    Return an htcondor.Schedd connected to *schedd_name*.
+    Falls back to the local schedd if schedd_name is None/empty or if the
+    Collector lookup fails.
     """
-    result = subprocess.run(
-        ["condor_q", "-json", str(cluster_id)],
-        capture_output=True, text=True, check=True,
-    )
-    ads = json.loads(result.stdout or "[]")
+    if not schedd_name:
+        return htcondor_mod.Schedd()
+    try:
+        coll = htcondor_mod.Collector()
+        schedd_ad = coll.locate(htcondor_mod.DaemonTypes.Schedd, schedd_name)
+        return htcondor_mod.Schedd(schedd_ad)
+    except Exception as exc:
+        log.warning(
+            "Could not locate schedd %r via Collector (%s); "
+            "falling back to local schedd", schedd_name, exc,
+        )
+        return htcondor_mod.Schedd()
+
+
+def _query_condor_q(
+    cluster_id: str, schedd_name: str | None
+) -> list[_CondorJobSummary]:
+    """
+    Query active HTCondor jobs for *cluster_id* using the Python bindings.
+    Runs synchronously; call via run_in_executor.
+    """
+    import htcondor
+    schedd = _get_schedd(htcondor, schedd_name)
+    ads = list(schedd.query(
+        constraint=f"ClusterId == {cluster_id}",
+        projection=["ClusterId", "ProcId", "JobStatus", "ExitCode", "HoldReason"],
+    ))
     summaries = []
     for ad in ads:
         cid = f"{ad.get('ClusterId', cluster_id)}.{ad.get('ProcId', 0)}"
         summaries.append(_CondorJobSummary(
             cluster_id  = str(ad.get("ClusterId", cluster_id)),
             job_status  = int(ad.get("JobStatus", 0)),
-            hold_reason = ad.get("HoldReason", ""),
+            hold_reason = ad.get("HoldReason", "") or "",
             exit_code   = ad.get("ExitCode"),
             proc_ids    = [cid],
         ))
     return summaries
 
 
-def _query_condor_history(cluster_id: str) -> list[_CondorJobSummary]:
+def _query_condor_history(
+    cluster_id: str, schedd_name: str | None
+) -> list[_CondorJobSummary]:
     """
-    Query condor_history for jobs no longer in the queue (completed/failed).
+    Query completed/removed jobs for *cluster_id* using the Python bindings.
+    Runs synchronously; call via run_in_executor.
     """
-    result = subprocess.run(
-        ["condor_history", "-json", str(cluster_id)],
-        capture_output=True, text=True, check=True,
-    )
-    ads = json.loads(result.stdout or "[]")
+    import htcondor
+    schedd = _get_schedd(htcondor, schedd_name)
+    ads = list(schedd.history(
+        constraint=f"ClusterId == {cluster_id}",
+        projection=["ClusterId", "ProcId", "JobStatus", "ExitCode", "HoldReason"],
+    ))
     summaries = []
     for ad in ads:
         cid = f"{ad.get('ClusterId', cluster_id)}.{ad.get('ProcId', 0)}"
         summaries.append(_CondorJobSummary(
             cluster_id  = str(ad.get("ClusterId", cluster_id)),
-            job_status  = int(ad.get("JobStatus", 4)),   # 4 = Completed
-            hold_reason = ad.get("HoldReason", ""),
+            job_status  = int(ad.get("JobStatus", 4)),
+            hold_reason = ad.get("HoldReason", "") or "",
             exit_code   = ad.get("ExitCode"),
             proc_ids    = [cid],
         ))
@@ -205,6 +230,10 @@ class HTCondorMonitor:
     cluster_id : str
         The HTCondor cluster ID returned by bps submit.
     bus : EventBus
+    schedd_name : str | None
+        FQDN of the schedd that owns this cluster (e.g.
+        ``"sdfiana032.sdf.slac.stanford.edu"``).  None falls back to the
+        local schedd.
     wake_strategy : WakeStrategy
         Defaults to TimerWakeStrategy(60).
     stop_event : asyncio.Event
@@ -217,6 +246,7 @@ class HTCondorMonitor:
         node_id:       str,
         cluster_id:    str,
         bus:           EventBus,
+        schedd_name:   str | None = None,
         wake_strategy: WakeStrategy | None = None,
         stop_event:    asyncio.Event | None = None,
     ) -> None:
@@ -224,6 +254,7 @@ class HTCondorMonitor:
         self.node_id       = node_id
         self.cluster_id    = cluster_id
         self.bus           = bus
+        self.schedd_name   = schedd_name
         self.wake_strategy = wake_strategy or TimerWakeStrategy()
         self.stop_event    = stop_event or asyncio.Event()
 
@@ -237,8 +268,9 @@ class HTCondorMonitor:
         ``asyncio.create_task(monitor.run())``.
         """
         log.info(
-            "Monitor[%s/%s]: watching cluster %s",
+            "Monitor[%s/%s]: watching cluster %s on schedd %s",
             self.workflow_id, self.node_id, self.cluster_id,
+            self.schedd_name or "(local)",
         )
         async for _ in self.wake_strategy.wake_cycles():
             if self.stop_event.is_set() or self._node_done:
@@ -249,17 +281,14 @@ class HTCondorMonitor:
         loop = asyncio.get_running_loop()
         try:
             summaries = await loop.run_in_executor(
-                None, _query_condor_q, self.cluster_id
+                None,
+                functools.partial(_query_condor_q, self.cluster_id, self.schedd_name),
             )
-        except FileNotFoundError:
-            log.warning("condor_q not found — is HTCondor installed and on PATH?")
+        except ImportError as exc:
+            log.warning("htcondor bindings not available: %s", exc)
             return
-        except subprocess.CalledProcessError as exc:
-            log.warning("condor_q failed for cluster %s: %s",
-                        self.cluster_id, exc)
-            return
-        except json.JSONDecodeError as exc:
-            log.warning("condor_q JSON parse error for cluster %s: %s",
+        except Exception as exc:
+            log.warning("condor query failed for cluster %s: %s",
                         self.cluster_id, exc)
             return
 
@@ -267,10 +296,13 @@ class HTCondorMonitor:
             # Jobs no longer in queue — check history.
             try:
                 summaries = await loop.run_in_executor(
-                    None, _query_condor_history, self.cluster_id
+                    None,
+                    functools.partial(
+                        _query_condor_history, self.cluster_id, self.schedd_name
+                    ),
                 )
             except Exception as exc:
-                log.warning("condor_history failed: %s", exc)
+                log.warning("condor history failed: %s", exc)
                 return
 
         await self._process_summaries(summaries)

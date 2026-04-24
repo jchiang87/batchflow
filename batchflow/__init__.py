@@ -12,7 +12,7 @@ from .agent import (
     StdoutTransport, WebhookTransport, CallbackTransport,
 )
 from .runner import WorkflowRunner
-from .backends.bps import SubmissionBackend, BpsBackend, MockBackend
+from .backends.bps import SubmissionBackend, BpsBackend, MockBackend, SubmissionResult
 
 __all__ = [
     "WorkflowGraph", "PipelineNode", "NodeState",
@@ -24,5 +24,5 @@ __all__ = [
     "AgentHandler", "AgentNotification", "InterventionActions",
     "StdoutTransport", "WebhookTransport", "CallbackTransport",
     "WorkflowRunner",
-    "SubmissionBackend", "BpsBackend", "MockBackend",
+    "SubmissionBackend", "BpsBackend", "MockBackend", "SubmissionResult",
 ]

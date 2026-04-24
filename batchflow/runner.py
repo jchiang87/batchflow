@@ -25,7 +25,7 @@ from enum import Enum
 from pathlib import Path
 
 from .agent import AgentHandler
-from .backends.bps import SubmissionBackend
+from .backends.bps import SubmissionBackend, SubmissionResult
 from .bus import EventBus, EventType, JobEvent
 from .graph import NodeState, PipelineNode, WorkflowGraph
 from .monitor import HTCondorMonitor, WakeStrategy
@@ -137,6 +137,7 @@ class WorkflowRunner:
             live.state         = node.state
             live.restart_count = node.restart_count
             live.submit_id     = node.submit_id
+            live.schedd_name   = node.schedd_name
 
         in_flight = {NodeState.SUBMITTED, NodeState.RUNNING}
         for node in self._graph.nodes:
@@ -314,20 +315,21 @@ class WorkflowRunner:
         await self._store.save_workflow(self._graph)
 
     async def _submit_node(self, node: PipelineNode) -> None:
-        cluster_id = await self._backend.submit(
+        result: SubmissionResult = await self._backend.submit(
             node.bps_yaml,
             self._bps_dir,
             overrides=node.bps_overrides or None,
             log_dir=self._log_dir,
         )
-        node.submit_id = cluster_id
-        node.state     = NodeState.SUBMITTED
+        node.submit_id   = result.cluster_id
+        node.schedd_name = result.schedd_name
+        node.state       = NodeState.SUBMITTED
 
         await self._bus.publish(JobEvent(
             event_type  = EventType.JOB_SUBMITTED,
             workflow_id = self._graph.workflow_id,
             node_id     = node.node_id,
-            cluster_id  = cluster_id,
+            cluster_id  = result.cluster_id,
         ))
 
         self._spawn_monitor(node)
@@ -338,6 +340,7 @@ class WorkflowRunner:
             node_id       = node.node_id,
             cluster_id    = node.submit_id,
             bus           = self._bus,
+            schedd_name   = node.schedd_name,
             wake_strategy = self._wake_strategy,
             stop_event    = self._stop_event,
         )
