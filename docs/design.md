@@ -36,7 +36,7 @@ batchflow addresses this with three concrete capabilities:
   abort, modify) without needing to query the cluster directly.
 
 The initial target deployment is single-user, proof-of-concept scale on the SLAC
-SDF cluster. The design anticipates growth to multi-user, multi-workflow operation
+S3DF cluster. The design anticipates growth to multi-user, multi-workflow operation
 by hiding all infrastructure concerns behind abstract interfaces with concrete
 upgrade paths.
 
@@ -66,7 +66,7 @@ not reduce complexity.
 The `htcondor` Python package provides a typed API with proper exception types
 (`htcondor.HTCondorException`), structured ClassAd access without JSON parsing, and
 — critically — `htcondor.Collector().locate()` for connecting to a named schedd by
-hostname. This last capability is essential on the SDF cluster, where each
+hostname. This last capability is essential on the S3DF cluster, where each
 interactive node runs its own schedd. A subprocess approach using `condor_q` could
 only query the schedd on the node where the command was run; the Python bindings
 allow the monitoring process to reconnect to the correct schedd regardless of which
@@ -135,7 +135,7 @@ dependents of one node) and fan-in (a node that waits for multiple predecessors)
 
 ### 3.3 Multi-Schedd Support
 
-The SDF cluster runs one HTCondor schedd per interactive node (e.g. `sdfiana011`
+The S3DF cluster runs one HTCondor schedd per interactive node (e.g. `sdfiana011`
 through `sdfiana033`). A monitoring process running on a different node than the one
 used for submission cannot query the correct schedd without knowing its hostname.
 
@@ -344,7 +344,7 @@ transient failures are common and human review of each restart would be impracti
 
 ## 9. Outstanding Work
 
-- End-to-end validation on SDF with a single-node workflow, confirming that
+- End-to-end validation on S3DF with a single-node workflow, confirming that
   `BpsBackend` correctly captures the schedd FQDN at submit time and that
   `HTCondorMonitor` can reconnect to it from a different node.
 - Validate `BpsBackend` against actual `bps submit` behaviour — in particular,
