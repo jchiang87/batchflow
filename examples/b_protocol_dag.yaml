@@ -1,0 +1,48 @@
+# B-protocol run expressed as an explicit DAG.
+#
+# This is the "extended format" understood by load_eo_workflow() when
+# a `dependencies` key is present alongside `pipelines`.
+#
+# Parallel groups at each stage:
+#
+#   Stage 0 (immediate): read_noise, bias_stability          [parallel]
+#   Stage 1:             ptc         <- read_noise
+#                        defects_dark <- read_noise + bias_stability
+#                        divisadero   <- read_noise             [parallel]
+#   Stage 2:             linearity    <- ptc
+#                        bf_analysis  <- ptc                   [parallel]
+#   Stage 3:             raft_mosaics <- linearity + bf_analysis + defects_dark
+#   Stage 4 (final):     report       <- raft_mosaics + divisadero
+#
+b_protocol:
+  env_vars: []
+  pipelines:
+    - bps_eoReadNoise.yaml
+    - bps_eoBiasStability.yaml
+    - bps_cpPtc.yaml
+    - bps_eoDarkDefects.yaml
+    - bps_eoDivisaderoTearing.yaml
+    - bps_eoLinearity.yaml
+    - bps_eoBfAnalysis.yaml
+    - bps_eoRaftMosaics.yaml
+    - bps_eoReport.yaml
+
+  dependencies:
+    bps_cpPtc.yaml:
+      - bps_eoReadNoise.yaml
+    bps_eoDarkDefects.yaml:
+      - bps_eoReadNoise.yaml
+      - bps_eoBiasStability.yaml
+    bps_eoDivisaderoTearing.yaml:
+      - bps_eoReadNoise.yaml
+    bps_eoLinearity.yaml:
+      - bps_cpPtc.yaml
+    bps_eoBfAnalysis.yaml:
+      - bps_cpPtc.yaml
+    bps_eoRaftMosaics.yaml:
+      - bps_eoLinearity.yaml
+      - bps_eoBfAnalysis.yaml
+      - bps_eoDarkDefects.yaml
+    bps_eoReport.yaml:
+      - bps_eoRaftMosaics.yaml
+      - bps_eoDivisaderoTearing.yaml

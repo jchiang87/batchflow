@@ -1,0 +1,53 @@
+# Example: LSST Camera B-protocol run
+# Mirrors the run type previously defined in eo_pipelines_config.yaml
+# but expressed as an explicit dependency graph.
+#
+# Parallel groups:
+#   - read_noise and bias_stability run immediately in parallel
+#   - ptc waits for read_noise (needs bias calibration)
+#   - defects_dark waits for both read_noise and bias_stability
+#   - linearity, bf_analysis wait for ptc
+#   - reporting waits for everything
+#
+workflow: b_protocol
+
+nodes:
+  - id: read_noise
+    bps_yaml: bps_eoReadNoise.yaml
+    max_restarts: 5
+
+  - id: bias_stability
+    bps_yaml: bps_eoBiasStability.yaml
+    max_restarts: 5
+
+  - id: ptc
+    bps_yaml: bps_cpPtc.yaml
+    depends_on: [read_noise]
+    max_restarts: 3
+
+  - id: defects_dark
+    bps_yaml: bps_eoDarkDefects.yaml
+    depends_on: [read_noise, bias_stability]
+    max_restarts: 3
+
+  - id: linearity
+    bps_yaml: bps_eoLinearity.yaml
+    depends_on: [ptc]
+    max_restarts: 3
+
+  - id: bf_analysis
+    bps_yaml: bps_eoBfAnalysis.yaml
+    depends_on: [ptc]
+    max_restarts: 3
+
+  - id: divisadero
+    bps_yaml: bps_eoDivisaderoTearing.yaml
+    depends_on: [read_noise]
+    max_restarts: 3
+
+  - id: report
+    bps_yaml: bps_eoReport.yaml
+    depends_on: [linearity, bf_analysis, defects_dark, divisadero]
+    max_restarts: 1
+    metadata:
+      description: "Aggregate HTML report"
