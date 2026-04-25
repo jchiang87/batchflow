@@ -150,6 +150,30 @@ class WorkflowRunner:
     # Scheduler loop
     # ------------------------------------------------------------------
 
+    async def _sync_from_store(self) -> None:
+        """Merge externally-applied node-state changes written by the CLI."""
+        saved = await self._store.load_workflow(self._graph.workflow_id)
+        if saved is None:
+            return
+        changed = False
+        for node in saved.nodes:
+            live = self._graph._nodes.get(node.node_id)
+            if live is None:
+                continue
+            if live.state == node.state:
+                continue
+            log.info(
+                "Sync: node %r state %s -> %s (external change)",
+                node.node_id, live.state.value, node.state.value,
+            )
+            live.state         = node.state
+            live.submit_id     = node.submit_id
+            live.schedd_name   = node.schedd_name
+            live.restart_count = node.restart_count
+            changed = True
+        if changed:
+            await self._submit_ready_nodes()
+
     async def _scheduler_loop(self) -> RunOutcome:
         while True:
             await self._drain_queue()
@@ -173,6 +197,7 @@ class WorkflowRunner:
                 if not resumed:
                     return RunOutcome.STALLED
                 self._intervention_event.clear()
+                await self._sync_from_store()
                 continue
 
             # Not stalled — wait briefly for the next event.
@@ -182,7 +207,7 @@ class WorkflowRunner:
                 )
                 await self._handle_event(event)
             except asyncio.TimeoutError:
-                pass
+                await self._sync_from_store()
 
     async def _drain_queue(self) -> None:
         """Process all events currently queued, without blocking."""

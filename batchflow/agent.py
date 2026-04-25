@@ -370,9 +370,9 @@ class InterventionActions:
             actor       = actor,
             reason      = reason,
         )
+        await self._store.save_workflow(self._graph)
         await self._bus.publish(event)
         await self._store.record_event(event)
-        await self._store.save_workflow(self._graph)
 
     async def abort_node(
         self,
