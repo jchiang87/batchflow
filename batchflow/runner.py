@@ -297,10 +297,14 @@ class WorkflowRunner:
         for node in ready:
             self._graph.mark_ready(node.node_id)
 
-        results = await asyncio.gather(
-            *[self._submit_node(node) for node in ready],
-            return_exceptions=True,
-        )
+        results = []
+        for i, node in enumerate(ready):
+            if i > 0:
+                await asyncio.sleep(1)
+            try:
+                results.append(await self._submit_node(node))
+            except Exception as exc:
+                results.append(exc)
         for node, result in zip(ready, results):
             if isinstance(result, Exception):
                 log.error("Submission failed for %r: %s", node.node_id, result)
