@@ -218,13 +218,24 @@ def intervene():
 @click.option("--work-dir", "-w", default=".", show_default=True)
 @click.option("--workflow-id", default=None)
 @click.option("--reason", default="manual restart via CLI")
+def intervene_restart(node_id, work_dir, workflow_id, reason):
+    """Restart a held or failed node via bps restart."""
+    asyncio.run(_intervene(Path(work_dir), workflow_id,
+                           "restart", node_id, reason))
+
+
+@intervene.command("resubmit")
+@click.argument("node_id")
+@click.option("--work-dir", "-w", default=".", show_default=True)
+@click.option("--workflow-id", default=None)
+@click.option("--reason", default="manual resubmit via CLI")
 @click.option("--override", "-o", multiple=True,
               help="BPS override as key=value.")
-def intervene_restart(node_id, work_dir, workflow_id, reason, override):
-    """Restart a held or failed node."""
+def intervene_resubmit(node_id, work_dir, workflow_id, reason, override):
+    """Submit a failed node from scratch via bps submit."""
     overrides = dict(kv.split("=", 1) for kv in override)
     asyncio.run(_intervene(Path(work_dir), workflow_id,
-                           "restart", node_id, reason, overrides))
+                           "resubmit", node_id, reason, overrides))
 
 
 @intervene.command("skip")
@@ -281,8 +292,10 @@ async def _intervene(work_dir, workflow_id, action, node_id,
 
     try:
         if action == "restart":
-            await actions.restart_node(node_id, reason=reason, actor="cli",
-                                       bps_overrides=bps_overrides)
+            await actions.restart_node(node_id, reason=reason, actor="cli")
+        elif action == "resubmit":
+            await actions.resubmit_node(node_id, reason=reason, actor="cli",
+                                        bps_overrides=bps_overrides)
         elif action == "skip":
             await actions.skip_node(node_id, reason=reason, actor="cli")
         elif action == "abort":

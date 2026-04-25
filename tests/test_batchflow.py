@@ -540,7 +540,7 @@ class TestWorkflowRunner:
                                        workflow_id="restart_monitor_wf", node_id="a"))
             await asyncio.sleep(0.1)
 
-            # Agent restarts — this triggers a fresh BPS submit
+            # Agent restarts — this calls bps restart for the new cluster
             await actions.restart_node("a", reason="test")
             await asyncio.sleep(0.1)
 

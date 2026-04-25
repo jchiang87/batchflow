@@ -88,6 +88,10 @@ class SubmissionBackend(ABC):
     async def remove(self, cluster_id: str) -> None:
         """Run ``condor_rm <cluster_id>`` to abort all jobs in the cluster."""
 
+    @abstractmethod
+    async def restart(self, cluster_id: str) -> SubmissionResult:
+        """Run ``bps restart --id <cluster_id>`` and return the new SubmissionResult."""
+
 
 # ---------------------------------------------------------------------------
 # BPS implementation
@@ -190,6 +194,27 @@ class BpsBackend(SubmissionBackend):
     async def remove(self, cluster_id: str) -> None:
         await self._run_condor(["condor_rm", cluster_id])
 
+    async def restart(self, cluster_id: str) -> SubmissionResult:
+        cmd = ["bps", "restart", "--id", cluster_id]
+        log.info("Restarting: %s", " ".join(cmd))
+        loop = asyncio.get_running_loop()
+        stdout, stderr = await loop.run_in_executor(None, self._run_bps, cmd)
+        if "RuntimeError" in stdout or "RuntimeError" in stderr:
+            raise RuntimeError(
+                f"bps restart reported RuntimeError for cluster {cluster_id}:\n"
+                + stdout[-2000:]
+            )
+        new_cluster_id = self._parse_cluster_id(stdout)
+        try:
+            import htcondor
+            m = re.search(r'alias=([^>&]+)', htcondor.Schedd().location.address)
+            schedd_name = m.group(1) if m else ""
+        except Exception:
+            schedd_name = ""
+        log.info("Restarted cluster %s → new cluster %s on schedd %s",
+                 cluster_id, new_cluster_id, schedd_name)
+        return SubmissionResult(cluster_id=new_cluster_id, schedd_name=schedd_name)
+
     @staticmethod
     async def _run_condor(cmd: list[str]) -> None:
         loop = asyncio.get_running_loop()
@@ -242,3 +267,15 @@ class MockBackend(SubmissionBackend):
 
     async def remove(self, cluster_id: str) -> None:
         log.info("MockBackend: remove %s", cluster_id)
+
+    async def restart(self, cluster_id: str) -> SubmissionResult:
+        new_cluster_id = str(self._next_id)
+        self._next_id += 1
+        record = {
+            "cluster_id":     new_cluster_id,
+            "schedd_name":    "mock-schedd",
+            "restarted_from": cluster_id,
+        }
+        self.submitted.append(record)
+        log.info("MockBackend: restart %s → cluster %s", cluster_id, new_cluster_id)
+        return SubmissionResult(cluster_id=new_cluster_id, schedd_name="mock-schedd")

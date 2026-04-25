@@ -332,10 +332,9 @@ class InterventionActions:
         node_id: str,
         reason: str = "",
         actor: str = "agent",
-        bps_overrides: dict | None = None,
     ) -> None:
         """
-        Release held jobs or re-submit if the node has fully failed.
+        Release held jobs or call bps restart if the node has fully failed.
         Increments restart_count; refuses if max_restarts exceeded.
         """
         node = self._graph.node(node_id)
@@ -353,17 +352,55 @@ class InterventionActions:
         if node.state == NodeState.HELD and node.submit_id:
             await self._backend.release_held(node.submit_id)
         else:
-            # Re-submit from scratch.
-            overrides = {**node.bps_overrides, **(bps_overrides or {})}
-            result = await self._backend.submit(
-                node.bps_yaml, self._bps_dir, overrides=overrides or None
-            )
+            if not node.submit_id:
+                raise RuntimeError(
+                    f"Node {node_id!r} is FAILED but has no submit_id; "
+                    "cannot call bps restart"
+                )
+            result = await self._backend.restart(node.submit_id)
             node.submit_id   = result.cluster_id
             node.schedd_name = result.schedd_name
 
         node.state = NodeState.SUBMITTED
         event = JobEvent(
             event_type  = EventType.INTERVENTION_RESTART,
+            workflow_id = self._graph.workflow_id,
+            node_id     = node_id,
+            cluster_id  = node.submit_id,
+            actor       = actor,
+            reason      = reason,
+        )
+        await self._store.save_workflow(self._graph)
+        await self._bus.publish(event)
+        await self._store.record_event(event)
+
+    async def resubmit_node(
+        self,
+        node_id: str,
+        reason: str = "",
+        actor: str = "agent",
+        bps_overrides: dict | None = None,
+    ) -> None:
+        """
+        Submit a FAILED node from scratch via bps submit, bypassing
+        restart_count / max_restarts.  Use when a completely fresh
+        submission is needed rather than a bps restart of the prior run.
+        """
+        node = self._graph.node(node_id)
+        if node.state != NodeState.FAILED:
+            raise RuntimeError(
+                f"Node {node_id!r} cannot be resubmitted "
+                f"(state={node.state.value}); must be FAILED"
+            )
+        overrides = {**node.bps_overrides, **(bps_overrides or {})}
+        result = await self._backend.submit(
+            node.bps_yaml, self._bps_dir, overrides=overrides or None
+        )
+        node.submit_id   = result.cluster_id
+        node.schedd_name = result.schedd_name
+        node.state = NodeState.SUBMITTED
+        event = JobEvent(
+            event_type  = EventType.INTERVENTION_RESUBMIT,
             workflow_id = self._graph.workflow_id,
             node_id     = node_id,
             cluster_id  = node.submit_id,
