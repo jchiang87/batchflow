@@ -168,14 +168,12 @@ class BpsBackend(SubmissionBackend):
 
         bps typically prints lines like:
             Submit dir: /path/to/submit/dir
-            Run Id: 20240101T120000Z
-            HTCondor cluster id: 12345
+            Run Id: 31931.0
+            Run Name: u_operator_payload_name_timestamp
         We try a few patterns in order of specificity.
         """
         patterns = [
-            r"HTCondor cluster id:\s*(\d+)",
-            r"cluster[_\s]id[:\s]+(\d+)",
-            r"Cluster\s+(\d+)\s+submitted",
+            r"Run Id:\s*(\d+)",
         ]
         for pat in patterns:
             m = re.search(pat, output, re.IGNORECASE)
