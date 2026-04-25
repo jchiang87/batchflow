@@ -497,6 +497,80 @@ class TestWorkflowRunner:
         assert g.node("p").restart_count == 1
         await store.close()
 
+    @pytest.mark.asyncio
+    async def test_restart_failed_node_spawns_monitor(self):
+        """Restarting a FAILED node must spawn a monitor for the new cluster."""
+        from batchflow.runner import RunOutcome
+        g = WorkflowGraph("restart_monitor_wf")
+        g.add_node(PipelineNode("a", "a.yaml", max_restarts=1))
+        g.add_node(PipelineNode("b", "b.yaml", depends_on=["a"]))
+        g.validate()
+
+        bus = EventBus()
+        _ = bus.subscribe("sink")
+        backend = MockBackend()
+        store = SqliteStateStore(":memory:")
+        await store.init()
+        await store.save_workflow(g)
+
+        runner = WorkflowRunner(
+            graph=g, backend=backend, store=store,
+            bus=bus, bps_dir=Path("/fake"),
+            stall_timeout=5.0,
+        )
+        actions = InterventionActions(
+            graph=g, backend=backend, bus=bus,
+            store=store, bps_dir=Path("/fake"),
+        )
+
+        monitor_spawned = asyncio.Event()
+
+        async def wait_submitted(node_id):
+            for _ in range(100):
+                if g._nodes[node_id].submit_id:
+                    return
+                await asyncio.sleep(0.02)
+
+        async def inject():
+            await wait_submitted("a")
+            first_cluster = g.node("a").submit_id
+
+            # First attempt fails
+            await bus.publish(JobEvent(event_type=EventType.NODE_FAILED,
+                                       workflow_id="restart_monitor_wf", node_id="a"))
+            await asyncio.sleep(0.1)
+
+            # Agent restarts — this triggers a fresh BPS submit
+            await actions.restart_node("a", reason="test")
+            await asyncio.sleep(0.1)
+
+            # A new cluster_id must have been assigned
+            assert g.node("a").submit_id != first_cluster, \
+                "restart_node should have submitted a new cluster"
+
+            # A monitor task must now exist for the new cluster
+            task = runner._monitor_tasks.get("a")
+            assert task is not None and not task.done(), \
+                "no live monitor task after restarting a FAILED node"
+            monitor_spawned.set()
+
+            # Drive the restarted node to completion via direct injection
+            await bus.publish(JobEvent(event_type=EventType.NODE_COMPLETE,
+                                       workflow_id="restart_monitor_wf", node_id="a"))
+            await wait_submitted("b")
+            await bus.publish(JobEvent(event_type=EventType.NODE_COMPLETE,
+                                       workflow_id="restart_monitor_wf", node_id="b"))
+
+        results = await asyncio.wait_for(
+            asyncio.gather(runner.run(), inject()),
+            timeout=15.0,
+        )
+        assert monitor_spawned.is_set()
+        assert results[0] == RunOutcome.COMPLETE
+        assert g.node("a").restart_count == 1
+        assert g.node("b").state == NodeState.SUCCEEDED
+        await store.close()
+
 # ---------------------------------------------------------------------------
 # Loader tests
 # ---------------------------------------------------------------------------

@@ -255,8 +255,17 @@ class WorkflowRunner:
                 node.state = NodeState.RUNNING
                 await self._store.save_workflow(self._graph)
 
+        elif event.event_type == EventType.INTERVENTION_RESTART:
+            self._intervention_event.set()
+            node = self._graph._nodes.get(node_id)
+            if node is not None and node.submit_id:
+                existing = self._monitor_tasks.get(node_id)
+                if existing is not None and not existing.done():
+                    existing.cancel()
+                self._spawn_monitor(node)
+            await self._submit_ready_nodes()
+
         elif event.event_type in {
-            EventType.INTERVENTION_RESTART,
             EventType.INTERVENTION_SKIP,
             EventType.INTERVENTION_MODIFY,
             EventType.INTERVENTION_ABORT,
