@@ -6,7 +6,7 @@ from smolagents import CodeAgent, Tool, OpenAIServerModel
 from .agent import AgentNotification, InterventionActions
 
 
-_interventions: InterventionActions | None = None
+_agent_semaphore = asyncio.Semaphore(3)  # At most 3 simultaneous LLMs.
 
 
 def _get_model() -> OpenAIServerModel:
@@ -53,34 +53,55 @@ class RestartNodeTool(Tool):
     }
     output_type = "null"
 
+    def __init__(self, interventions: InterventionActions):
+        super().__init__()
+        self._interventions = interventions
+
     async def forward(
             self,
             node_id: str,
             reason: str = "",
             actor: str = "smolagents.CodeAgent",
     ):
-        await _interventions.restart_node(node_id, reason, actor)
+        await self._interventions.restart_node(node_id, reason, actor)
 
 
-async def code_agent_callback(
+async def _run_agent(
+        agent: CodeAgent,
         notification: AgentNotification,
-        interventions: InterventionActions
 ) -> None:
-    global _interventions
-    _interventions = interventions
-    my_agent = CodeAgent(
-        model=_get_model(),
-        tools=[RestartNodeTool()],
-        additional_authorized_imports=["json"],
-        name="smolagents_CodeAgent",
-        description="Handles blocked nodes in the workflow graph.",
-        instructions=(
-            "Based on the notification.hold_reasons and the "
-            "notification.classification, perform specific "
-            "interventions to recover the workflow.  For now, handle "
-            "all interventions the same way: running the restart_node tool."
-        ),
-        verbosity_level=0,
-    )
+    async with _agent_semaphore:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            agent.run,
+            f"Handle the following notification:\n{notification.to_json()}"
+        )
 
-    asyncio.create_task(my_agent.run(f"Handle the {notification}"))
+
+def make_code_agent_callback(interventions: InterventionActions):
+    """
+    Factory to create a callback function for handling AgentNotifications.
+    """
+    def my_callback(notification: AgentNotification) -> None:
+        restart_tool = RestartNodeTool(interventions)
+        my_agent = CodeAgent(
+            model=_get_model(),
+            tools=[restart_tool],
+            additional_authorized_imports=["json"],
+            name="smolagents_CodeAgent",
+            description="Handles blocked nodes in the workflow graph.",
+            instructions=(
+                "Based on the notification.hold_reasons and the "
+                "notification.classification, perform specific "
+                "interventions to recover the workflow.  For now, "
+                "handle all interventions the same way: running the "
+                "restart_node tool."
+            ),
+            verbosity_level=0,
+        )
+        asyncio.create_task(
+            _run_agent(my_agent, notification),
+            name=f"agent-{notification.node_id}",
+        )
+    return my_callback
