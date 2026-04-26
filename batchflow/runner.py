@@ -160,17 +160,25 @@ class WorkflowRunner:
             live = self._graph._nodes.get(node.node_id)
             if live is None:
                 continue
-            if live.state == node.state:
+            if live.state == node.state and live.submit_id == node.submit_id:
                 continue
             log.info(
                 "Sync: node %r state %s -> %s (external change)",
                 node.node_id, live.state.value, node.state.value,
             )
+            old_submit_id      = live.submit_id
             live.state         = node.state
             live.submit_id     = node.submit_id
             live.schedd_name   = node.schedd_name
             live.restart_count = node.restart_count
             changed = True
+            if (node.state in {NodeState.SUBMITTED, NodeState.RUNNING}
+                    and node.submit_id
+                    and node.submit_id != old_submit_id):
+                existing = self._monitor_tasks.get(node.node_id)
+                if existing is not None and not existing.done():
+                    existing.cancel()
+                self._spawn_monitor(live)
         if changed:
             await self._submit_ready_nodes()
 
@@ -236,7 +244,9 @@ class WorkflowRunner:
                     )
                     await self._handle_event(event)
                 except asyncio.TimeoutError:
-                    pass
+                    await self._sync_from_store()
+                    if not self._graph.is_stalled():
+                        self._intervention_event.set()
             return True
 
         if self._stall_timeout is not None:
