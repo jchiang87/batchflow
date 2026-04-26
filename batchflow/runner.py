@@ -293,6 +293,7 @@ class WorkflowRunner:
         elif event.event_type in {
             EventType.INTERVENTION_RESTART,
             EventType.INTERVENTION_RESUBMIT,
+            EventType.INTERVENTION_MODIFY,
         }:
             self._intervention_event.set()
             node = self._graph._nodes.get(node_id)
@@ -305,7 +306,6 @@ class WorkflowRunner:
 
         elif event.event_type in {
             EventType.INTERVENTION_SKIP,
-            EventType.INTERVENTION_MODIFY,
             EventType.INTERVENTION_ABORT,
         }:
             self._intervention_event.set()
