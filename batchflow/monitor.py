@@ -305,6 +305,29 @@ class HTCondorMonitor:
                 log.warning("condor history failed: %s", exc)
                 return
 
+        if not summaries:
+            # Cluster absent from both condor_q and condor_history.  This can
+            # happen if the schedd evicts old history entries under memory
+            # pressure before our poll cycle fires.  Only treat this as a
+            # completion if we previously saw the cluster (non-empty
+            # _last_status), meaning the jobs ran and finished before being
+            # evicted.  If we have never seen it, log a warning and keep
+            # polling — it may simply not have appeared yet.
+            if self._last_status:
+                log.warning(
+                    "Monitor[%s/%s]: cluster %s absent from condor_q and "
+                    "condor_history; assuming completed",
+                    self.workflow_id, self.node_id, self.cluster_id,
+                )
+                await self._process_summaries([])
+            else:
+                log.warning(
+                    "Monitor[%s/%s]: cluster %s not yet visible in condor_q; "
+                    "will retry next poll",
+                    self.workflow_id, self.node_id, self.cluster_id,
+                )
+            return
+
         await self._process_summaries(summaries)
 
     async def _process_summaries(
