@@ -11,6 +11,7 @@ workflows   List all known workflows in the StateStore.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -34,8 +35,20 @@ def _require_env(*names: str) -> None:
 
 @click.group()
 @click.version_option()
-def cli():
+@click.option(
+    "--log-level", "-l",
+    default="WARNING",
+    show_default=True,
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                      case_sensitive=False),
+    help="Set the logging level.",
+)
+def cli(log_level):
     """batchflow — async DAG workflow runner for HTCondor/BPS."""
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
 
 
 # ---------------------------------------------------------------------------
