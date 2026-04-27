@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -122,7 +122,7 @@ async def test_code_agent_runner_restarts_held_node(tmp_path):
     g, bus, backend, store, interventions = await _make_fixtures(
         tmp_path, node_state=NodeState.HELD
     )
-    runner = CodeAgentRunner([RestartNodeTool(interventions)])
+    runner = CodeAgentRunner([RestartNodeTool(interventions)], use_agent=False)
     agent_handler = AgentHandler(
         bus=bus, graph=g, classifier=ErrorClassifier(),
         transports=[CallbackTransport(runner.run)],
@@ -142,7 +142,7 @@ async def test_code_agent_runner_restarts_failed_node(tmp_path):
     g, bus, backend, store, interventions = await _make_fixtures(
         tmp_path, node_state=NodeState.FAILED
     )
-    runner = CodeAgentRunner([RestartNodeTool(interventions)])
+    runner = CodeAgentRunner([RestartNodeTool(interventions)], use_agent=False)
     agent_handler = AgentHandler(
         bus=bus, graph=g, classifier=ErrorClassifier(),
         transports=[CallbackTransport(runner.run)],
@@ -169,7 +169,7 @@ async def test_code_agent_runner_logs_error_on_non_restartable_node(tmp_path, ca
     )
     g.node("a").restart_count = 1  # already at max
 
-    runner = CodeAgentRunner([RestartNodeTool(interventions)])
+    runner = CodeAgentRunner([RestartNodeTool(interventions)], use_agent=False)
     agent_handler = AgentHandler(
         bus=bus, graph=g, classifier=ErrorClassifier(),
         transports=[CallbackTransport(runner.run)],
@@ -226,7 +226,7 @@ async def test_code_agent_runner_concurrent_limit(tmp_path):
     interventions.restart_node = slow_restart
 
     # Fresh CodeAgentRunner instance — no shared global semaphore to reset.
-    runner = CodeAgentRunner([RestartNodeTool(interventions)])
+    runner = CodeAgentRunner([RestartNodeTool(interventions)], use_agent=False)
     agent_handler = AgentHandler(
         bus=bus, graph=g, classifier=ErrorClassifier(),
         transports=[CallbackTransport(runner.run)],
@@ -253,24 +253,143 @@ async def test_code_agent_runner_concurrent_limit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# CodeAgentRunner — workflow-level sentinel
+# ---------------------------------------------------------------------------
+
+async def test_code_agent_runner_ignores_workflow_sentinel(tmp_path):
+    """WORKFLOW_COMPLETE/STALLED carry node_id='__workflow__'; runner must skip them."""
+    g, bus, backend, store, interventions = await _make_fixtures(tmp_path)
+    interventions.restart_node = AsyncMock()
+    runner = CodeAgentRunner([RestartNodeTool(interventions)], use_agent=False)
+
+    from batchflow.agent import AgentNotification
+    from batchflow.classifier import Classification
+    from datetime import datetime, timezone
+
+    notification = AgentNotification(
+        event_type="WORKFLOW_COMPLETE",
+        workflow_id="cb_test",
+        node_id="__workflow__",
+        timestamp=datetime.now(timezone.utc),
+        hold_reasons=[],
+        classification=Classification("unknown", 0.0, [], None),
+        restart_count=0,
+        max_restarts=0,
+        dag_context={},
+        bps_yaml="",
+        metadata={},
+    )
+    await runner.run(notification)
+    await asyncio.sleep(0.1)
+    interventions.restart_node.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # make_code_agent_callback shim
 # ---------------------------------------------------------------------------
 
 async def test_make_code_agent_callback_shim(tmp_path):
-    """make_code_agent_callback is a one-liner shim that returns runner.run."""
+    """make_code_agent_callback returns a CodeAgentRunner.run bound to interventions."""
+    # Make sure DONT_USE_AGENT env var is not set.
+    import os
+    if "DONT_USE_AGENT" in os.environ:
+        del os.environ["DONT_USE_AGENT"]
+
     g, bus, backend, store, interventions = await _make_fixtures(
         tmp_path, node_state=NodeState.HELD
     )
-    callback = make_code_agent_callback(interventions)
+    # Patch _get_model so no live API key is needed; _build_agent returns a mock agent.
+    mock_agent = MagicMock()
+    mock_agent.run.return_value = None
+
+    with patch("batchflow.code_agent.CodeAgentRunner._build_agent",
+               return_value=mock_agent):
+        callback = make_code_agent_callback(interventions)
+        agent_handler = AgentHandler(
+            bus=bus, graph=g, classifier=ErrorClassifier(),
+            transports=[CallbackTransport(callback)],
+            interventions=interventions,
+        )
+
+        await bus.publish(JobEvent(
+            event_type=EventType.NODE_HELD, workflow_id="cb_test", node_id="a",
+        ))
+        await _run_handler_until(
+            agent_handler, lambda: mock_agent.run.called, timeout=5.0
+        )
+
+    mock_agent.run.assert_called_once()
+    call_arg = mock_agent.run.call_args[0][0]
+    assert call_arg.startswith("Please handle ")
+    assert '"node_id"' in call_arg
+
+
+# ---------------------------------------------------------------------------
+# CodeAgentRunner — use_agent=True path
+# ---------------------------------------------------------------------------
+
+async def test_code_agent_runner_uses_agent(tmp_path):
+    """With use_agent=True, runner calls agent.run() with the serialised notification."""
+    g, bus, backend, store, interventions = await _make_fixtures(
+        tmp_path, node_state=NodeState.HELD
+    )
+    runner = CodeAgentRunner([RestartNodeTool(interventions)], use_agent=True)
+
+    mock_agent = MagicMock()
+    mock_agent.run.return_value = None
+
     agent_handler = AgentHandler(
         bus=bus, graph=g, classifier=ErrorClassifier(),
-        transports=[CallbackTransport(callback)],
+        transports=[CallbackTransport(runner.run)],
         interventions=interventions,
     )
 
-    await bus.publish(JobEvent(
-        event_type=EventType.NODE_HELD, workflow_id="cb_test", node_id="a",
-    ))
-    await _run_handler_until(agent_handler, lambda: g.node("a").state == NodeState.SUBMITTED)
+    with patch.object(runner, "_build_agent", return_value=mock_agent):
+        await bus.publish(JobEvent(
+            event_type=EventType.NODE_HELD, workflow_id="cb_test", node_id="a",
+        ))
+        await _run_handler_until(
+            agent_handler, lambda: mock_agent.run.called, timeout=5.0
+        )
 
-    assert g.node("a").state == NodeState.SUBMITTED
+    mock_agent.run.assert_called_once()
+    call_arg = mock_agent.run.call_args[0][0]
+    assert call_arg.startswith("Please handle ")
+    assert '"node_id"' in call_arg
+
+
+# ---------------------------------------------------------------------------
+# CodeAgentRunner — timeout
+# ---------------------------------------------------------------------------
+
+async def test_code_agent_runner_timeout(tmp_path, caplog):
+    """agent_timeout fires when agent.run() hangs; error is logged, no exception raised."""
+    import time
+    g, bus, backend, store, interventions = await _make_fixtures(
+        tmp_path, node_state=NodeState.HELD
+    )
+    runner = CodeAgentRunner(
+        [RestartNodeTool(interventions)], use_agent=True, agent_timeout=0.1
+    )
+
+    mock_agent = MagicMock()
+    mock_agent.run.side_effect = lambda _prompt: time.sleep(10)
+
+    agent_handler = AgentHandler(
+        bus=bus, graph=g, classifier=ErrorClassifier(),
+        transports=[CallbackTransport(runner.run)],
+        interventions=interventions,
+    )
+
+    with patch.object(runner, "_build_agent", return_value=mock_agent):
+        with caplog.at_level(logging.ERROR, logger="batchflow.code_agent"):
+            await bus.publish(JobEvent(
+                event_type=EventType.NODE_HELD, workflow_id="cb_test", node_id="a",
+            ))
+            await _run_handler_until(
+                agent_handler,
+                lambda: any("timed out" in r.message for r in caplog.records),
+                timeout=5.0,
+            )
+
+    assert any("timed out" in r.message for r in caplog.records)

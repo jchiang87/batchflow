@@ -59,6 +59,7 @@ Use `stall_timeout=N` in tests to make the runner return `RunOutcome.STALLED` af
 | Monitor wake | `TimerWakeStrategy` (60s) | `InotifyWakeStrategy` (watchfiles) |
 | Submission | `BpsBackend` | Any `SubmissionBackend` subclass |
 | Notifications | `StdoutTransport` | `WebhookTransport`, `CallbackTransport` |
+| Agent callback | `make_code_agent_callback` (smolagents `CodeAgent`) | `CodeAgentRunner(use_agent=False)` for direct tool dispatch |
 
 Swap any backend by passing a different instance to `WorkflowRunner` or `AgentHandler`.
 
@@ -103,6 +104,9 @@ batchflow intervene abort  <node_id>
 | Variable | Description |
 |---|---|
 | `BATCHFLOW_WEBHOOK` | Optional URL for agent notifications |
+| `DONT_USE_AGENT` | Set to any value to disable the smolagents `CodeAgent` and call `RestartNodeTool` directly (useful for testing) |
+| `ANTHROPIC_DEFAULT_MODEL` | Override the default model ID (`claude-sonnet-4-6`) used by `CodeAgentRunner` |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Fine-grained override for the Sonnet model (takes precedence over `ANTHROPIC_DEFAULT_MODEL` if set in `~/.claude/settings.json` env) |
 
 ## Key Design Decisions
 
@@ -117,3 +121,7 @@ batchflow intervene abort  <node_id>
 **Why htcondor Python bindings instead of subprocess?** The `htcondor` package provides a typed API with proper exception types (`htcondor.HTCondorException`), no JSON parsing, and — critically — `htcondor.Collector().locate()` enables connecting to a named schedd on any node. The subprocess approach only worked when the agent ran on the same node as the submission.
 
 **Why store `schedd_name` on `PipelineNode`?** The schedd is determined at submit time (when we know which node we're on). Capturing it then and persisting it with the graph state means the monitor always reconnects to the right schedd, even after a resume on a different node.
+
+**Why does `CodeAgentRunner` use `asyncio.to_thread` + `asyncio.wait_for`?** `smolagents.CodeAgent.run()` is a blocking call (synchronous HTTP to the model API). Running it in a thread executor keeps the asyncio event loop free. `wait_for` imposes a hard deadline (`agent_timeout`, default 300 s) so a hung model call cannot stall the workflow indefinitely.
+
+**Why is `node_id == "__workflow__"` skipped in `CodeAgentRunner.run()`?** `WORKFLOW_COMPLETE` and `WORKFLOW_STALLED` events use `"__workflow__"` as a sentinel node ID. These are informational — there is no node to restart — so the runner returns early rather than attempting a graph lookup that would raise `KeyError`.

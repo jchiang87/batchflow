@@ -95,11 +95,21 @@ class CodeAgentRunner:
         dependencies) before being passed here.
     max_concurrent : int
         Maximum number of tool invocations running simultaneously.
+    use_agent : bool
+        If True (default), route notifications through a ``smolagents.CodeAgent``
+        that decides which tool to call.  If False, call ``RestartNodeTool``
+        directly — useful for testing without a live model.
+    agent_timeout : float | None
+        Seconds to wait for the agent to finish before cancelling it and
+        logging a timeout error.  None means no limit.
     """
 
-    def __init__(self, tools: list[BatchflowTool], max_concurrent: int = 3):
+    def __init__(self, tools: list[BatchflowTool], max_concurrent: int = 3,
+                 use_agent: bool = True, agent_timeout: float | None = 300.0):
         self._tools = tools
         self._max_concurrent = max_concurrent
+        self._use_agent = use_agent
+        self._agent_timeout = agent_timeout
         self._semaphore: asyncio.Semaphore | None = None
 
     def _get_semaphore(self) -> asyncio.Semaphore:
@@ -107,24 +117,46 @@ class CodeAgentRunner:
             self._semaphore = asyncio.Semaphore(self._max_concurrent)
         return self._semaphore
 
+    def _build_agent(self) -> CodeAgent:
+        return CodeAgent(tools=self._tools, model=_get_model())
+
     async def run(self, notification: AgentNotification) -> None:
         log.debug("CodeAgentRunner.run: node_id=%r", notification.node_id)
+        if notification.node_id == "__workflow__":
+            log.debug("CodeAgentRunner: skipping workflow-level notification %r",
+                      notification.event_type)
+            return
         loop = asyncio.get_running_loop()
         for tool in self._tools:
             tool.set_loop(loop)
         os.environ["IGNORE_SIGNAL"] = "True"
 
-        restart_tool = next(
-            (t for t in self._tools if isinstance(t, RestartNodeTool)), None
-        )
-        if restart_tool is None:
-            log.error("CodeAgentRunner: no RestartNodeTool registered")
-            return
-
         async def _run_and_catch():
             try:
                 async with self._get_semaphore():
-                    await asyncio.to_thread(restart_tool.forward, notification.node_id)
+                    if self._use_agent:
+                        agent = self._build_agent()
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                agent.run,
+                                f"Please handle {notification.to_json()}",
+                            ),
+                            timeout=self._agent_timeout,
+                        )
+                    else:
+                        restart_tool = next(
+                            (t for t in self._tools if isinstance(t, RestartNodeTool)),
+                            None,
+                        )
+                        if restart_tool is None:
+                            log.error("CodeAgentRunner: no RestartNodeTool registered")
+                            return
+                        await asyncio.to_thread(restart_tool.forward, notification.node_id)
+            except asyncio.TimeoutError:
+                log.error(
+                    "CodeAgentRunner timed out after %.0fs for node %r",
+                    self._agent_timeout, notification.node_id,
+                )
             except Exception as exc:
                 log.error("CodeAgentRunner restart failed: %s", exc, exc_info=exc)
 
@@ -133,4 +165,5 @@ class CodeAgentRunner:
 
 def make_code_agent_callback(interventions: InterventionActions):
     """Convenience shim: returns a CodeAgentRunner.run bound to interventions."""
-    return CodeAgentRunner([RestartNodeTool(interventions)]).run
+    use_agent = not "DONT_USE_AGENT" in os.environ
+    return CodeAgentRunner([RestartNodeTool(interventions)], use_agent=use_agent).run
