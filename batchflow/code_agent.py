@@ -105,7 +105,7 @@ class CodeAgentRunner:
     """
 
     def __init__(self, tools: list[BatchflowTool], max_concurrent: int = 3,
-                 use_agent: bool = True, agent_timeout: float | None = 300.0):
+                 use_agent: bool = True, agent_timeout: float | None = 120.0):
         self._tools = tools
         self._max_concurrent = max_concurrent
         self._use_agent = use_agent
@@ -118,7 +118,21 @@ class CodeAgentRunner:
         return self._semaphore
 
     def _build_agent(self) -> CodeAgent:
-        return CodeAgent(tools=self._tools, model=_get_model())
+        return CodeAgent(
+            tools=self._tools,
+            model=_get_model(),
+            additional_authorized_imports=["json"],
+            name="smolagents_CodeAgent",
+            description="Handles blocked nodes in the workflow graph.",
+            instructions=(
+                "Based on the notification.hold_reasons and the "
+                "notification.classification, perform specific "
+                "interventions to recover the workflow.  For now, "
+                "handle all interventions the same way: running the "
+                "restart_node tool."
+            ),
+            verbosity_level=1,
+        )
 
     async def run(self, notification: AgentNotification) -> None:
         log.debug("CodeAgentRunner.run: node_id=%r", notification.node_id)
