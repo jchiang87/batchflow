@@ -266,10 +266,14 @@ class AgentHandler:
         )
 
         # Fan out to all transports concurrently.
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[t.send(notification) for t in self._transports],
             return_exceptions=True,
         )
+        for transport, result in zip(self._transports, results):
+            if isinstance(result, BaseException):
+                log.error("Transport %s raised: %s", transport, result,
+                          exc_info=result)
 
         # Optionally act autonomously on transient failures.
         if (

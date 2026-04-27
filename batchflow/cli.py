@@ -105,10 +105,12 @@ def submit(workflow_yaml, work_dir, bps_source, instrument,
 async def _run_workflow(graph, work_dir, bps_source, instrument,
                         poll_interval, auto_restart, webhook):
     from .agent import (AgentHandler, InterventionActions,
-                        StdoutTransport, WebhookTransport)
+                        StdoutTransport, WebhookTransport,
+                        CallbackTransport)
     from .backends.bps import BpsBackend
     from .bus import EventBus
     from .classifier import ErrorClassifier
+    from .code_agent import make_code_agent_callback
     from .monitor import TimerWakeStrategy
     from .runner import WorkflowRunner
     from .workspace import WorkspaceManager
@@ -133,14 +135,17 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
         patterns_file=patterns_file if patterns_file.exists() else None
     )
 
-    transports = [StdoutTransport()]
-    if webhook:
-        transports.append(WebhookTransport(webhook))
-
     interventions = InterventionActions(
         graph=graph, backend=backend, bus=bus,
         store=store, bps_dir=ws.bps_dir,
     )
+
+    agent_callback = make_code_agent_callback(interventions)
+
+    transports = [StdoutTransport(), CallbackTransport(agent_callback)]
+    if webhook:
+        transports.append(WebhookTransport(webhook))
+
     agent_handler = AgentHandler(
         bus=bus, graph=graph, classifier=classifier,
         transports=transports, interventions=interventions,

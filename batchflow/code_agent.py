@@ -2,11 +2,11 @@ import os
 import asyncio
 import json
 from pathlib import Path
+import logging
 from smolagents import CodeAgent, Tool, OpenAIServerModel
 from .agent import AgentNotification, InterventionActions
 
-
-_agent_semaphore = asyncio.Semaphore(3)  # At most 3 simultaneous LLMs.
+log = logging.getLogger(__name__)
 
 
 def _get_model() -> OpenAIServerModel:
@@ -24,7 +24,14 @@ def _get_model() -> OpenAIServerModel:
     )
 
 
-class RestartNodeTool(Tool):
+class BatchflowTool(Tool):
+    """Base class for batchflow smolagents tools. Handles event loop injection."""
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+
+class RestartNodeTool(BatchflowTool):
     name = "restart_node"
     description = (
         "Restart a node from the workflow graph.  This restarts "
@@ -37,7 +44,7 @@ class RestartNodeTool(Tool):
             "type": "string",
             "description": ("The ID of the node in the workflow graph, "
                             "e.g., 'stage_1a'."),
-            "nullable": False,
+            "nullable": True,
         },
         "reason": {
             "type": "string",
@@ -56,52 +63,74 @@ class RestartNodeTool(Tool):
     def __init__(self, interventions: InterventionActions):
         super().__init__()
         self._interventions = interventions
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-    async def forward(
+    def forward(
             self,
-            node_id: str,
+            node_id: str = "",
             reason: str = "",
             actor: str = "smolagents.CodeAgent",
     ):
-        await self._interventions.restart_node(node_id, reason, actor)
-
-
-async def _run_agent(
-        agent: CodeAgent,
-        notification: AgentNotification,
-) -> None:
-    async with _agent_semaphore:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            agent.run,
-            f"Handle the following notification:\n{notification.to_json()}"
+        log.debug("restart_tool.forward: node_id=%r", node_id)
+        future = asyncio.run_coroutine_threadsafe(
+            self._interventions.restart_node(node_id, reason, actor),
+            self._loop,
         )
+        log.debug("restart_tool.forward: submitted coroutine, awaiting result")
+        future.result()
+        log.debug("restart_tool.forward: done")
+
+
+class CodeAgentRunner:
+    """
+    Drives smolagents tools in response to AgentNotifications.
+
+    Owns the concurrency semaphore and injects the event loop into tools
+    at first call time.  Pass ``runner.run`` to ``CallbackTransport``.
+
+    Parameters
+    ----------
+    tools : list[BatchflowTool]
+        Tools to make available.  Each must be fully constructed (with its
+        dependencies) before being passed here.
+    max_concurrent : int
+        Maximum number of tool invocations running simultaneously.
+    """
+
+    def __init__(self, tools: list[BatchflowTool], max_concurrent: int = 3):
+        self._tools = tools
+        self._max_concurrent = max_concurrent
+        self._semaphore: asyncio.Semaphore | None = None
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._max_concurrent)
+        return self._semaphore
+
+    async def run(self, notification: AgentNotification) -> None:
+        log.debug("CodeAgentRunner.run: node_id=%r", notification.node_id)
+        loop = asyncio.get_running_loop()
+        for tool in self._tools:
+            tool.set_loop(loop)
+        os.environ["IGNORE_SIGNAL"] = "True"
+
+        restart_tool = next(
+            (t for t in self._tools if isinstance(t, RestartNodeTool)), None
+        )
+        if restart_tool is None:
+            log.error("CodeAgentRunner: no RestartNodeTool registered")
+            return
+
+        async def _run_and_catch():
+            try:
+                async with self._get_semaphore():
+                    await asyncio.to_thread(restart_tool.forward, notification.node_id)
+            except Exception as exc:
+                log.error("CodeAgentRunner restart failed: %s", exc, exc_info=exc)
+
+        asyncio.create_task(_run_and_catch(), name=f"agent-{notification.node_id}")
 
 
 def make_code_agent_callback(interventions: InterventionActions):
-    """
-    Factory to create a callback function for handling AgentNotifications.
-    """
-    def my_callback(notification: AgentNotification) -> None:
-        restart_tool = RestartNodeTool(interventions)
-        my_agent = CodeAgent(
-            model=_get_model(),
-            tools=[restart_tool],
-            additional_authorized_imports=["json"],
-            name="smolagents_CodeAgent",
-            description="Handles blocked nodes in the workflow graph.",
-            instructions=(
-                "Based on the notification.hold_reasons and the "
-                "notification.classification, perform specific "
-                "interventions to recover the workflow.  For now, "
-                "handle all interventions the same way: running the "
-                "restart_node tool."
-            ),
-            verbosity_level=0,
-        )
-        asyncio.create_task(
-            _run_agent(my_agent, notification),
-            name=f"agent-{notification.node_id}",
-        )
-    return my_callback
+    """Convenience shim: returns a CodeAgentRunner.run bound to interventions."""
+    return CodeAgentRunner([RestartNodeTool(interventions)]).run
