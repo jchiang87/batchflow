@@ -18,11 +18,11 @@ from typing import Iterable
 class NodeState(str, Enum):
     PENDING   = "PENDING"    # waiting on dependencies
     READY     = "READY"      # dependencies met, not yet submitted
-    SUBMITTED = "SUBMITTED"  # bps submit called, awaiting HTCondor
-    RUNNING   = "RUNNING"    # at least one HTCondor job active
+    SUBMITTED = "SUBMITTED"  # submit called, awaiting execution
+    RUNNING   = "RUNNING"    # at least one job active
     SUCCEEDED = "SUCCEEDED"
     FAILED    = "FAILED"
-    HELD      = "HELD"       # one or more jobs held in HTCondor
+    HELD      = "HELD"       # execution paused, awaiting intervention
     SKIPPED   = "SKIPPED"    # intentionally bypassed by agent
 
 
@@ -48,28 +48,29 @@ class PipelineNode:
         IDs of nodes that must reach a terminal state before this node
         becomes READY.  An empty list means the node is a root and will
         be submitted immediately.
-    bps_overrides : dict
-        Key/value pairs that the submission backend may merge into the
-        BPS YAML at submit time (useful for agent-driven retries with
-        different resource requests).
+    overrides : dict
+        Key/value pairs forwarded to the submission backend at submit time
+        (e.g. BPS ``--override`` arguments for agent-driven retries).
     max_restarts : int
         Maximum number of agent-initiated restarts before the node is
         considered permanently failed.
     metadata : dict
         Arbitrary user data carried through to AgentNotifications.
     """
-    node_id:       str
-    bps_yaml:      str
-    depends_on:    list[str]  = field(default_factory=list)
-    bps_overrides: dict       = field(default_factory=dict)
-    max_restarts:  int        = 3
-    metadata:      dict       = field(default_factory=dict)
+    node_id:         str
+    bps_yaml:        str | None = None
+    node_type:       str        = "bps"
+    command:         str | None = None
+    depends_on:      list[str]  = field(default_factory=list)
+    overrides:       dict       = field(default_factory=dict)
+    max_restarts:    int        = 3
+    metadata:        dict       = field(default_factory=dict)
 
     # Runtime state — managed by WorkflowRunner, not set by users.
-    state:          NodeState = field(default=NodeState.PENDING, init=False)
-    restart_count:  int       = field(default=0, init=False)
-    submit_id:      str | None = field(default=None, init=False)  # HTCondor cluster id
-    schedd_name:    str | None = field(default=None, init=False)  # FQDN of submission schedd
+    state:           NodeState  = field(default=NodeState.PENDING, init=False)
+    restart_count:   int        = field(default=0, init=False)
+    submit_id:       str | None = field(default=None, init=False)
+    submit_location: str | None = field(default=None, init=False)
 
     def __post_init__(self):
         if not re.match(r'^[A-Za-z0-9_\-]+$', self.node_id):

@@ -80,7 +80,8 @@ def submit(workflow_yaml, work_dir, bps_source, instrument,
     click.echo(f"\nNodes ({len(graph.nodes)}):")
     for node in graph.nodes:
         deps = f"  <- {node.depends_on}" if node.depends_on else ""
-        click.echo(f"  {node.node_id:<30}  {node.bps_yaml}{deps}")
+        node_spec = node.bps_yaml or node.command or ""
+        click.echo(f"  {node.node_id:<30}  {node_spec}{deps}")
     click.echo()
 
     if dry_run:
@@ -107,7 +108,7 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
     from .agent import (AgentHandler, InterventionActions,
                         StdoutTransport, WebhookTransport,
                         CallbackTransport)
-    from .backends.bps import BpsBackend
+    from .backends.bps import BpsHtcondorBackend
     from .bus import EventBus
     from .classifier import ErrorClassifier
     from .code_agent import make_code_agent_callback
@@ -126,7 +127,7 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
     ws.prepare()
 
     bus     = EventBus()
-    backend = BpsBackend()
+    backend = BpsHtcondorBackend(bps_dir=ws.bps_dir)
     store   = SqliteStateStore(ws.db_path)
     await store.init()
 
@@ -136,8 +137,7 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
     )
 
     interventions = InterventionActions(
-        graph=graph, backend=backend, bus=bus,
-        store=store, bps_dir=ws.bps_dir,
+        graph=graph, backend=backend, bus=bus, store=store,
     )
 
     agent_callback = make_code_agent_callback(interventions)
@@ -153,7 +153,7 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
     )
     runner = WorkflowRunner(
         graph=graph, backend=backend, store=store, bus=bus,
-        bps_dir=ws.bps_dir, log_dir=ws.log_dir,
+        log_dir=ws.log_dir,
         wake_strategy=TimerWakeStrategy(interval=poll_interval),
         agent_handler=agent_handler,
     )
@@ -281,7 +281,7 @@ def intervene_abort(node_id, work_dir, workflow_id, reason):
 async def _intervene(work_dir, workflow_id, action, node_id,
                      reason="", bps_overrides=None):
     from .agent import InterventionActions
-    from .backends.bps import BpsBackend
+    from .backends.bps import BpsHtcondorBackend
     from .bus import EventBus
 
     db = _db_from_workdir(work_dir)
@@ -302,10 +302,9 @@ async def _intervene(work_dir, workflow_id, action, node_id,
 
     bus     = EventBus()
     _sink   = bus.subscribe("cli_sink")
-    backend = BpsBackend()
+    backend = BpsHtcondorBackend(bps_dir=work_dir / "bps")
     actions = InterventionActions(
-        graph=graph, backend=backend, bus=bus,
-        store=store, bps_dir=work_dir / "bps",
+        graph=graph, backend=backend, bus=bus, store=store,
     )
 
     try:
@@ -313,7 +312,7 @@ async def _intervene(work_dir, workflow_id, action, node_id,
             await actions.restart_node(node_id, reason=reason, actor="cli")
         elif action == "resubmit":
             await actions.resubmit_node(node_id, reason=reason, actor="cli",
-                                        bps_overrides=bps_overrides)
+                                        overrides=bps_overrides)
         elif action == "skip":
             await actions.skip_node(node_id, reason=reason, actor="cli")
         elif action == "abort":
@@ -409,7 +408,7 @@ async def _resume_workflow(work_dir, workflow_id, poll_interval,
                            auto_restart, webhook):
     from .agent import (AgentHandler, InterventionActions,
                         StdoutTransport, WebhookTransport)
-    from .backends.bps import BpsBackend
+    from .backends.bps import BpsHtcondorBackend
     from .bus import EventBus
     from .classifier import ErrorClassifier
     from .monitor import TimerWakeStrategy
@@ -436,7 +435,7 @@ async def _resume_workflow(work_dir, workflow_id, poll_interval,
     click.echo()
 
     bus     = EventBus()
-    backend = BpsBackend()
+    backend = BpsHtcondorBackend(bps_dir=work_dir / "bps")
     patterns_file = work_dir / "error_patterns.yaml"
     classifier = ErrorClassifier(
         patterns_file=patterns_file if patterns_file.exists() else None
@@ -446,8 +445,7 @@ async def _resume_workflow(work_dir, workflow_id, poll_interval,
         transports.append(WebhookTransport(webhook))
 
     interventions = InterventionActions(
-        graph=graph, backend=backend, bus=bus,
-        store=store, bps_dir=work_dir / "bps",
+        graph=graph, backend=backend, bus=bus, store=store,
     )
     agent_handler = AgentHandler(
         bus=bus, graph=graph, classifier=classifier,
@@ -456,7 +454,7 @@ async def _resume_workflow(work_dir, workflow_id, poll_interval,
     )
     runner = WorkflowRunner(
         graph=graph, backend=backend, store=store, bus=bus,
-        bps_dir=work_dir / "bps", log_dir=work_dir / "logs",
+        log_dir=work_dir / "logs",
         wake_strategy=TimerWakeStrategy(interval=poll_interval),
         agent_handler=agent_handler,
     )

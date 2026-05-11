@@ -49,7 +49,7 @@ class AgentNotification:
     workflow_id, node_id : str
     timestamp : datetime
     hold_reasons : list[str]
-        Raw HTCondor HoldReason strings.
+        Reason strings from the backend (e.g. HTCondor HoldReason).
     classification : Classification
         Classifier output — verdict, confidence, suggested_action.
     restart_count : int
@@ -58,8 +58,9 @@ class AgentNotification:
     dag_context : dict[str, str]
         Maps node_id → state.value for all nodes in the workflow,
         so the agent can see what is blocked downstream.
-    bps_yaml : str
-        The BPS file this node uses (useful for crafting modified retries).
+    node_spec : str
+        Human-readable description of what this node runs (bps_yaml
+        filename for BPS nodes, command string for shell nodes).
     metadata : dict
         Arbitrary metadata from the PipelineNode definition.
     """
@@ -72,7 +73,7 @@ class AgentNotification:
     restart_count:   int
     max_restarts:    int
     dag_context:     dict[str, str]
-    bps_yaml:        str
+    node_spec:       str
     metadata:        dict = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -261,7 +262,7 @@ class AgentHandler:
                 n.node_id: n.state.value
                 for n in self._graph.nodes
             },
-            bps_yaml       = node.bps_yaml if node else "",
+            node_spec      = (node.bps_yaml or node.command or "") if node else "",
             metadata       = node.metadata if node else {},
         )
 
@@ -313,7 +314,6 @@ class InterventionActions:
     backend : SubmissionBackend
     bus : EventBus
     store : StateStore
-    bps_dir : Path
     """
 
     def __init__(
@@ -322,14 +322,12 @@ class InterventionActions:
         backend: "SubmissionBackend",
         bus: EventBus,
         store: "StateStore",
-        bps_dir: "Path",
     ) -> None:
         from .backends.bps import SubmissionBackend  # avoid top-level circular
         self._graph   = graph
         self._backend = backend
         self._bus     = bus
         self._store   = store
-        self._bps_dir = bps_dir
 
     async def restart_node(
         self,
@@ -359,18 +357,18 @@ class InterventionActions:
             if not node.submit_id:
                 raise RuntimeError(
                     f"Node {node_id!r} is FAILED but has no submit_id; "
-                    "cannot call bps restart"
+                    "cannot restart"
                 )
             result = await self._backend.restart(node.submit_id)
-            node.submit_id   = result.cluster_id
-            node.schedd_name = result.schedd_name
+            node.submit_id       = result.submit_id
+            node.submit_location = result.submit_location
 
         node.state = NodeState.SUBMITTED
         event = JobEvent(
             event_type  = EventType.INTERVENTION_RESTART,
             workflow_id = self._graph.workflow_id,
             node_id     = node_id,
-            cluster_id  = node.submit_id,
+            cluster_id  = node.submit_id,   # cluster_id field kept for audit log
             actor       = actor,
             reason      = reason,
         )
@@ -383,12 +381,12 @@ class InterventionActions:
         node_id: str,
         reason: str = "",
         actor: str = "agent",
-        bps_overrides: dict | None = None,
+        overrides: dict | None = None,
     ) -> None:
         """
-        Submit a FAILED node from scratch via bps submit, bypassing
-        restart_count / max_restarts.  Use when a completely fresh
-        submission is needed rather than a bps restart of the prior run.
+        Submit a FAILED node from scratch, bypassing restart_count /
+        max_restarts.  Use when a completely fresh submission is needed
+        rather than a restart of the prior run.
         """
         node = self._graph.node(node_id)
         if node.state != NodeState.FAILED:
@@ -396,12 +394,10 @@ class InterventionActions:
                 f"Node {node_id!r} cannot be resubmitted "
                 f"(state={node.state.value}); must be FAILED"
             )
-        overrides = {**node.bps_overrides, **(bps_overrides or {})}
-        result = await self._backend.submit(
-            node.bps_yaml, self._bps_dir, overrides=overrides or None
-        )
-        node.submit_id   = result.cluster_id
-        node.schedd_name = result.schedd_name
+        node.overrides = {**node.overrides, **(overrides or {})}
+        result = await self._backend.submit(node)
+        node.submit_id       = result.submit_id
+        node.submit_location = result.submit_location
         node.state = NodeState.SUBMITTED
         event = JobEvent(
             event_type  = EventType.INTERVENTION_RESUBMIT,
@@ -422,7 +418,7 @@ class InterventionActions:
         actor: str = "agent",
     ) -> None:
         """
-        Cancel all HTCondor jobs for this node and mark it FAILED.
+        Cancel all jobs for this node and mark it FAILED.
         Dependents remain PENDING (workflow is stalled until skipped or
         the node is restarted manually).
         """
@@ -449,7 +445,7 @@ class InterventionActions:
     ) -> None:
         """
         Mark a node SKIPPED so its dependents are unblocked.
-        If HTCondor jobs exist they are cancelled first.
+        If jobs exist they are cancelled first.
         """
         node = self._graph.node(node_id)
         if node.submit_id:
@@ -473,32 +469,30 @@ class InterventionActions:
     async def modify_node(
         self,
         node_id: str,
-        bps_overrides: dict[str, str],
+        overrides: dict[str, str],
         reason: str = "",
         actor: str = "agent",
     ) -> None:
         """
-        Abort the current submission and re-submit with different BPS
-        parameters (e.g. more memory, different queue).
+        Abort the current submission and re-submit with different parameters
+        (e.g. more memory, different queue).
         """
         node = self._graph.node(node_id)
         if node.submit_id:
             await self._backend.remove(node.submit_id)
-        node.bps_overrides.update(bps_overrides)
-        result = await self._backend.submit(
-            node.bps_yaml, self._bps_dir, overrides=node.bps_overrides
-        )
-        node.submit_id   = result.cluster_id
-        node.schedd_name = result.schedd_name
+        node.overrides.update(overrides)
+        result = await self._backend.submit(node)
+        node.submit_id       = result.submit_id
+        node.submit_location = result.submit_location
         node.state = NodeState.SUBMITTED
         event = JobEvent(
             event_type  = EventType.INTERVENTION_MODIFY,
             workflow_id = self._graph.workflow_id,
             node_id     = node_id,
-            cluster_id  = result.cluster_id,
+            cluster_id  = result.submit_id,
             actor       = actor,
             reason      = reason,
-            extra       = {"bps_overrides": bps_overrides},
+            extra       = {"overrides": overrides},
         )
         await self._bus.publish(event)
         await self._store.record_event(event)

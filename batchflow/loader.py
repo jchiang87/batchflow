@@ -63,12 +63,12 @@ def load_workflow(path: str | Path) -> WorkflowGraph:
             raise ValueError(f"Node {nd['id']!r} missing 'bps_yaml'")
 
         node = PipelineNode(
-            node_id       = nd["id"],
-            bps_yaml      = nd["bps_yaml"],
-            depends_on    = nd.get("depends_on", []),
-            bps_overrides = nd.get("bps_overrides", {}),
-            max_restarts  = nd.get("max_restarts", 3),
-            metadata      = nd.get("metadata", {}),
+            node_id      = nd["id"],
+            bps_yaml     = nd["bps_yaml"],
+            depends_on   = nd.get("depends_on", []),
+            overrides    = nd.get("bps_overrides", {}),
+            max_restarts = nd.get("max_restarts", 3),
+            metadata     = nd.get("metadata", {}),
         )
         graph.add_node(node)
 

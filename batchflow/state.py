@@ -266,16 +266,18 @@ def _serialize_graph(graph: WorkflowGraph) -> str:
         "workflow_id": graph.workflow_id,
         "nodes": [
             {
-                "node_id":       n.node_id,
-                "bps_yaml":      n.bps_yaml,
-                "depends_on":    n.depends_on,
-                "bps_overrides": n.bps_overrides,
-                "max_restarts":  n.max_restarts,
-                "metadata":      n.metadata,
-                "state":         n.state.value,
-                "restart_count": n.restart_count,
-                "submit_id":     n.submit_id,
-                "schedd_name":   n.schedd_name,
+                "node_id":         n.node_id,
+                "node_type":       n.node_type,
+                "bps_yaml":        n.bps_yaml,
+                "command":         n.command,
+                "depends_on":      n.depends_on,
+                "overrides":       n.overrides,
+                "max_restarts":    n.max_restarts,
+                "metadata":        n.metadata,
+                "state":           n.state.value,
+                "restart_count":   n.restart_count,
+                "submit_id":       n.submit_id,
+                "submit_location": n.submit_location,
             }
             for n in graph.nodes
         ],
@@ -288,17 +290,19 @@ def _deserialize_graph(json_str: str) -> WorkflowGraph:
     graph = WorkflowGraph(data["workflow_id"])
     for nd in data["nodes"]:
         node = PipelineNode(
-            node_id       = nd["node_id"],
-            bps_yaml      = nd["bps_yaml"],
-            depends_on    = nd["depends_on"],
-            bps_overrides = nd["bps_overrides"],
-            max_restarts  = nd["max_restarts"],
-            metadata      = nd["metadata"],
+            node_id   = nd["node_id"],
+            node_type = nd.get("node_type", "bps"),
+            bps_yaml  = nd.get("bps_yaml"),
+            command   = nd.get("command"),
+            depends_on = nd["depends_on"],
+            overrides  = nd.get("overrides", nd.get("bps_overrides", {})),
+            max_restarts = nd["max_restarts"],
+            metadata     = nd["metadata"],
         )
-        node.state         = NodeState(nd["state"])
-        node.restart_count = nd["restart_count"]
-        node.submit_id     = nd["submit_id"]
-        node.schedd_name   = nd.get("schedd_name")
+        node.state           = NodeState(nd["state"])
+        node.restart_count   = nd["restart_count"]
+        node.submit_id       = nd["submit_id"]
+        node.submit_location = nd.get("submit_location", nd.get("schedd_name"))
         graph.add_node(node)
     return graph
 

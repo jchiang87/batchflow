@@ -50,7 +50,7 @@ class WorkflowRunner:
     backend : SubmissionBackend
     store : StateStore
     bus : EventBus
-    bps_dir : Path
+
     log_dir : Path
     wake_strategy : WakeStrategy | None
     agent_handler : AgentHandler | None
@@ -65,7 +65,6 @@ class WorkflowRunner:
         backend:        SubmissionBackend,
         store:          StateStore,
         bus:            EventBus,
-        bps_dir:        Path,
         log_dir:        Path = Path("./logs"),
         wake_strategy:  WakeStrategy | None = None,
         agent_handler:  AgentHandler | None = None,
@@ -75,7 +74,6 @@ class WorkflowRunner:
         self._backend       = backend
         self._store         = store
         self._bus           = bus
-        self._bps_dir       = bps_dir
         self._log_dir       = log_dir
         self._wake_strategy = wake_strategy
         self._agent_handler = agent_handler
@@ -137,7 +135,7 @@ class WorkflowRunner:
             live.state         = node.state
             live.restart_count = node.restart_count
             live.submit_id     = node.submit_id
-            live.schedd_name   = node.schedd_name
+            live.submit_location = node.submit_location
 
         in_flight = {NodeState.SUBMITTED, NodeState.RUNNING}
         for node in self._graph.nodes:
@@ -169,7 +167,7 @@ class WorkflowRunner:
             old_submit_id      = live.submit_id
             live.state         = node.state
             live.submit_id     = node.submit_id
-            live.schedd_name   = node.schedd_name
+            live.submit_location = node.submit_location
             live.restart_count = node.restart_count
             changed = True
             if (node.state in {NodeState.SUBMITTED, NodeState.RUNNING}
@@ -367,20 +365,18 @@ class WorkflowRunner:
 
     async def _submit_node(self, node: PipelineNode) -> None:
         result: SubmissionResult = await self._backend.submit(
-            node.bps_yaml,
-            self._bps_dir,
-            overrides=node.bps_overrides or None,
+            node,
             log_dir=self._log_dir,
         )
-        node.submit_id   = result.cluster_id
-        node.schedd_name = result.schedd_name
+        node.submit_id       = result.submit_id
+        node.submit_location = result.submit_location
         node.state       = NodeState.SUBMITTED
 
         await self._bus.publish(JobEvent(
             event_type  = EventType.JOB_SUBMITTED,
             workflow_id = self._graph.workflow_id,
             node_id     = node.node_id,
-            cluster_id  = result.cluster_id,
+            cluster_id  = result.submit_id,
         ))
 
         self._spawn_monitor(node)
@@ -391,7 +387,7 @@ class WorkflowRunner:
             node_id       = node.node_id,
             cluster_id    = node.submit_id,
             bus           = self._bus,
-            schedd_name   = node.schedd_name,
+            schedd_name   = node.submit_location,
             wake_strategy = self._wake_strategy,
             stop_event    = self._stop_event,
         )
