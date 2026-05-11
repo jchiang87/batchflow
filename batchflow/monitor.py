@@ -1,20 +1,24 @@
 """
-monitor.py — HTCondorMonitor with pluggable wake strategy.
+monitor.py — AbstractNodeRunner, HTCondorNodeRunner, and wake strategies.
 
-The monitor runs as a long-lived asyncio task.  It watches one HTCondor
-cluster (one bps submission) and emits JobEvents onto the EventBus
-whenever a job's state changes.
+AbstractNodeRunner
+    ABC with a single ``run()`` coroutine.  Every backend provides a
+    concrete implementation that watches one submitted node and publishes
+    JobEvents (JOB_RUNNING, NODE_COMPLETE, NODE_FAILED, NODE_HELD) to the
+    EventBus until the node reaches a terminal state.
+
+HTCondorNodeRunner (alias: HTCondorMonitor)
+    Polls the HTCondor schedd on each WakeStrategy tick and synthesises
+    node-level events from per-proc job status transitions.
 
 Wake strategies
 ---------------
 TimerWakeStrategy   — sleeps for a fixed interval, then queries the schedd.
-                      Used now; works on any filesystem.
 InotifyWakeStrategy — wakes immediately when the DAGMan event log is
-                      written.  Suitable once inotify is available on
-                      the shared filesystem.  Swap in by passing a
-                      different strategy to HTCondorMonitor.
+                      written.  Falls back to a timer if watchfiles is
+                      unavailable.
 
-Both strategies implement the same one-method interface so the monitor
+Both strategies implement the same one-method interface so the runner
 is completely unaware of which one is active.
 """
 from __future__ import annotations
@@ -31,6 +35,24 @@ from typing import AsyncIterator
 from .bus import EventBus, EventType, JobEvent
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Abstract node runner
+# ---------------------------------------------------------------------------
+
+class AbstractNodeRunner(ABC):
+    """
+    Watches one submitted node until it reaches a terminal state, publishing
+    JobEvents (JOB_RUNNING, NODE_COMPLETE, NODE_FAILED, NODE_HELD) to the
+    EventBus.
+
+    Run as an asyncio Task via ``asyncio.create_task(runner.run())``.
+    """
+
+    @abstractmethod
+    async def run(self) -> None:
+        ...  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +240,10 @@ def _query_condor_history(
 # Monitor
 # ---------------------------------------------------------------------------
 
-class HTCondorMonitor:
+class HTCondorNodeRunner(AbstractNodeRunner):
     """
     Watches one HTCondor cluster and publishes JobEvents to the EventBus.
+    Implements AbstractNodeRunner for HTCondor/BPS-HTCondor submissions.
 
     Parameters
     ----------
@@ -388,3 +411,6 @@ class HTCondorMonitor:
             ))
             log.info("Monitor[%s/%s]: node terminal → %s",
                      self.workflow_id, self.node_id, node_event.value)
+
+
+HTCondorMonitor = HTCondorNodeRunner  # backward-compatibility alias

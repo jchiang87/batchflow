@@ -22,13 +22,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from enum import Enum
-from pathlib import Path
+from pathlib import Path  # used by log_dir default
 
 from .agent import AgentHandler
 from .backends.bps import SubmissionBackend, SubmissionResult
 from .bus import EventBus, EventType, JobEvent
 from .graph import NodeState, PipelineNode, WorkflowGraph
-from .monitor import HTCondorMonitor, WakeStrategy
+from .monitor import WakeStrategy
 from .state import StateStore
 
 log = logging.getLogger(__name__)
@@ -269,12 +269,16 @@ class WorkflowRunner:
             return
 
         if event.event_type == EventType.NODE_COMPLETE:
+            if event.cluster_id:
+                node.submit_id = event.cluster_id
             node.state = NodeState.SUCCEEDED
             log.info("Node %r succeeded", node_id)
             await self._store.save_workflow(self._graph)
             await self._submit_ready_nodes()
 
         elif event.event_type in {EventType.NODE_FAILED, EventType.NODE_HELD}:
+            if event.cluster_id:
+                node.submit_id = event.cluster_id
             node.state = (
                 NodeState.HELD
                 if event.event_type == EventType.NODE_HELD
@@ -382,16 +386,14 @@ class WorkflowRunner:
         self._spawn_monitor(node)
 
     def _spawn_monitor(self, node: PipelineNode) -> None:
-        monitor = HTCondorMonitor(
+        runner = self._backend.make_node_runner(
+            node,
+            self._bus,
+            self._stop_event,
             workflow_id   = self._graph.workflow_id,
-            node_id       = node.node_id,
-            cluster_id    = node.submit_id,
-            bus           = self._bus,
-            schedd_name   = node.submit_location,
             wake_strategy = self._wake_strategy,
-            stop_event    = self._stop_event,
         )
         task = asyncio.create_task(
-            monitor.run(), name=f"monitor-{node.node_id}"
+            runner.run(), name=f"monitor-{node.node_id}"
         )
         self._monitor_tasks[node.node_id] = task

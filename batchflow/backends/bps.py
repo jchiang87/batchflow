@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..graph import PipelineNode
+    from ..monitor import AbstractNodeRunner
+    from ..bus import EventBus
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +92,25 @@ class SubmissionBackend(ABC):
     @abstractmethod
     async def restart(self, submit_id: str) -> SubmissionResult:
         """Restart a failed/held job and return the new SubmissionResult."""
+
+    @abstractmethod
+    def make_node_runner(
+        self,
+        node: "PipelineNode",
+        bus: "EventBus",
+        stop_event: asyncio.Event,
+        *,
+        workflow_id: str = "",
+        wake_strategy: object = None,
+    ) -> "AbstractNodeRunner":
+        """
+        Return an AbstractNodeRunner that will monitor *node* until it
+        reaches a terminal state, publishing events to *bus*.
+        Run the returned object as an asyncio Task.
+
+        *workflow_id* and *wake_strategy* are forwarded to backends that
+        need them (e.g. HTCondor); blocking backends may ignore them.
+        """
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +245,26 @@ class BpsHtcondorBackend(SubmissionBackend):
                  submit_id, new_submit_id, submit_location)
         return SubmissionResult(submit_id=new_submit_id, submit_location=submit_location)
 
+    def make_node_runner(
+        self,
+        node: "PipelineNode",
+        bus: "EventBus",
+        stop_event: asyncio.Event,
+        *,
+        workflow_id: str = "",
+        wake_strategy: object = None,
+    ) -> "AbstractNodeRunner":
+        from ..monitor import HTCondorNodeRunner
+        return HTCondorNodeRunner(
+            workflow_id   = workflow_id,
+            node_id       = node.node_id,
+            cluster_id    = node.submit_id,
+            bus           = bus,
+            schedd_name   = node.submit_location,
+            wake_strategy = wake_strategy,
+            stop_event    = stop_event,
+        )
+
     @staticmethod
     async def _run_condor(cmd: list[str]) -> None:
         loop = asyncio.get_running_loop()
@@ -291,3 +332,28 @@ class MockBackend(SubmissionBackend):
         self.submitted.append(record)
         log.info("MockBackend: restart %s → %s", submit_id, new_submit_id)
         return SubmissionResult(submit_id=new_submit_id, submit_location="mock-schedd")
+
+    def make_node_runner(
+        self,
+        node: "PipelineNode",
+        bus: "EventBus",
+        stop_event: asyncio.Event,
+        *,
+        workflow_id: str = "",
+        wake_strategy: object = None,
+    ) -> "AbstractNodeRunner":
+        return _MockNodeRunner(stop_event)
+
+
+class _MockNodeRunner:
+    """
+    Node runner for MockBackend.  Waits on stop_event so the task stays
+    alive (like a real monitor) until the runner shuts down.  Tests drive
+    outcomes by injecting events directly onto the bus.
+    """
+
+    def __init__(self, stop_event: asyncio.Event) -> None:
+        self._stop_event = stop_event
+
+    async def run(self) -> None:
+        await self._stop_event.wait()
