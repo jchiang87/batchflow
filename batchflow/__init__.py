@@ -13,6 +13,7 @@ from .agent import (
 )
 from .runner import WorkflowRunner
 from .backends.bps import SubmissionBackend, BpsBackend, MockBackend, SubmissionResult
+from .backends.bps_parsl import BpsParslBackend, BlockingNodeRunner
 from .code_agent import make_code_agent_callback, BatchflowTool, CodeAgentRunner
 
 __all__ = [
@@ -26,5 +27,6 @@ __all__ = [
     "StdoutTransport", "WebhookTransport", "CallbackTransport",
     "WorkflowRunner",
     "SubmissionBackend", "BpsBackend", "MockBackend", "SubmissionResult",
+    "BpsParslBackend", "BlockingNodeRunner",
     "make_code_agent_callback", "BatchflowTool", "CodeAgentRunner",
 ]
