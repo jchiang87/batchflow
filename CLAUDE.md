@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-**batchflow** is a generic async workflow orchestrator for HTCondor/BPS batch systems. It submits jobs via `bps submit` and monitors them through HTCondor.
+**batchflow** is a generic async workflow orchestrator supporting multiple backends: HTCondor/BPS (`BpsHtcondorBackend`), Parsl-based BPS (`BpsParslBackend`), and arbitrary blocking shell scripts (`ShellBackend`). Mixed workflows are supported via `DispatchBackend`.
 
 ## Installation
 
@@ -31,7 +31,7 @@ python -m pytest tests/ -k "test_simple_linear"   # single test by name
 
 The runner never polls graph state on a timer. Instead:
 
-1. `HTCondorMonitor` wakes on `TimerWakeStrategy` (or `InotifyWakeStrategy` when available), queries the schedd via the `htcondor` Python bindings, and publishes `JobEvent` objects to the `EventBus`.
+1. `HTCondorNodeRunner` (formerly `HTCondorMonitor`) wakes on `TimerWakeStrategy` (or `InotifyWakeStrategy` when available), queries the schedd via the `htcondor` Python bindings, and publishes `JobEvent` objects to the `EventBus`.
 2. The `EventBus` fans each event out to per-subscriber `asyncio.Queue` instances — the runner, state store, and agent handler each get their own queue, so a slow agent webhook never stalls the scheduler.
 3. `WorkflowRunner._scheduler_loop` consumes its queue and transitions graph state. After each `NODE_COMPLETE` it calls `_submit_ready_nodes()`, which queries `WorkflowGraph.ready_nodes()` to find newly-unblocked nodes.
 
@@ -57,7 +57,10 @@ Use `stall_timeout=N` in tests to make the runner return `RunOutcome.STALLED` af
 |---|---|---|
 | State persistence | `SqliteStateStore` | `PostgresStateStore` (`backends/postgres.py`) |
 | Monitor wake | `TimerWakeStrategy` (60s) | `InotifyWakeStrategy` (watchfiles) |
-| Submission | `BpsBackend` | Any `SubmissionBackend` subclass |
+| Submission (HTCondor) | `BpsHtcondorBackend` (alias: `BpsBackend`) | — |
+| Submission (Parsl) | `BpsParslBackend` | — |
+| Submission (shell) | `ShellBackend` | — |
+| Submission (mixed) | `DispatchBackend({...})` | Any `SubmissionBackend` subclass |
 | Notifications | `StdoutTransport` | `WebhookTransport`, `CallbackTransport` |
 | Agent callback | `make_code_agent_callback` (smolagents `CodeAgent`) | `CodeAgentRunner(use_agent=False)` for direct tool dispatch |
 
@@ -65,16 +68,34 @@ Swap any backend by passing a different instance to `WorkflowRunner` or `AgentHa
 
 ### Multi-schedd support
 
-The cluster has one HTCondor schedd per interactive node (e.g. `sdfiana011`–`sdfiana033`). `BpsBackend.submit()` captures the submission schedd's FQDN from `htcondor.Schedd().location.address` and stores it in `PipelineNode.schedd_name`. `HTCondorMonitor` uses `htcondor.Collector().locate()` to reconnect to the correct schedd, so the agent can run on any node regardless of where `bps submit` was called. `schedd_name` is persisted in the `StateStore` so resume works correctly after restart.
+The cluster has one HTCondor schedd per interactive node (e.g. `sdfiana011`–`sdfiana033`). `BpsHtcondorBackend.submit()` captures the submission schedd's FQDN from `htcondor.Schedd().location.address` and stores it in `PipelineNode.submit_location`. `HTCondorNodeRunner` uses `htcondor.Collector().locate()` to reconnect to the correct schedd, so the agent can run on any node regardless of where `bps submit` was called. `submit_location` is persisted in the `StateStore` so resume works correctly after restart.
 
 ## Adding a New Pipeline Node
 
+BPS node (default `node_type: bps`):
 ```yaml
 nodes:
   - id: my_new_task
     bps_yaml: bps_myNewTask.yaml
     depends_on: [some_node]    # or [] for a root node
     max_restarts: 3
+```
+
+Shell node:
+```yaml
+nodes:
+  - id: prep
+    node_type: shell
+    command: /path/to/prep.sh
+    depends_on: []
+```
+
+Mixed workflow with `DispatchBackend`:
+```python
+backend = DispatchBackend({
+    "bps":   BpsHtcondorBackend(bps_dir=ws.bps_dir),
+    "shell": ShellBackend(),
+})
 ```
 
 ## Adding Custom Error Patterns
@@ -120,7 +141,7 @@ batchflow intervene abort  <node_id>
 
 **Why htcondor Python bindings instead of subprocess?** The `htcondor` package provides a typed API with proper exception types (`htcondor.HTCondorException`), no JSON parsing, and — critically — `htcondor.Collector().locate()` enables connecting to a named schedd on any node. The subprocess approach only worked when the agent ran on the same node as the submission.
 
-**Why store `schedd_name` on `PipelineNode`?** The schedd is determined at submit time (when we know which node we're on). Capturing it then and persisting it with the graph state means the monitor always reconnects to the right schedd, even after a resume on a different node.
+**Why store `submit_location` on `PipelineNode`?** The schedd is determined at submit time (when we know which node we're on). Capturing it then and persisting it with the graph state means the monitor always reconnects to the right schedd, even after a resume on a different node.
 
 **Why does `CodeAgentRunner` use `asyncio.to_thread` + `asyncio.wait_for`?** `smolagents.CodeAgent.run()` is a blocking call (synchronous HTTP to the model API). Running it in a thread executor keeps the asyncio event loop free. `wait_for` imposes a hard deadline (`agent_timeout`, default 300 s) so a hung model call cannot stall the workflow indefinitely.
 
