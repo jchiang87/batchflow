@@ -4,6 +4,7 @@ loader.py — Load WorkflowGraph from YAML or build programmatically.
 YAML format
 -----------
     workflow: b_protocol
+    bps_backend: htcondor               # "htcondor" (default) or "parsl"
 
     nodes:
       - id: prep
@@ -56,7 +57,15 @@ def load_workflow(path: str | Path) -> WorkflowGraph:
     if "nodes" not in data or not data["nodes"]:
         raise ValueError("Workflow YAML must contain at least one node")
 
-    graph = WorkflowGraph(data["workflow"])
+    _VALID_BPS_BACKENDS = {"htcondor", "parsl"}
+    bps_backend = data.get("bps_backend", "htcondor")
+    if bps_backend not in _VALID_BPS_BACKENDS:
+        raise ValueError(
+            f"bps_backend {bps_backend!r} must be one of "
+            f"{sorted(_VALID_BPS_BACKENDS)}"
+        )
+
+    graph = WorkflowGraph(data["workflow"], bps_backend=bps_backend)
 
     for nd in data["nodes"]:
         if "id" not in nd:

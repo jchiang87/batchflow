@@ -26,6 +26,23 @@ def _db_from_workdir(work_dir: Path) -> Path:
     return work_dir / "batchflow.db"
 
 
+def _make_backend(graph, bps_dir: Path):
+    """Return a DispatchBackend wired to the correct BPS backend."""
+    from .backends.dispatch import DispatchBackend
+    from .backends.shell import ShellBackend
+
+    if graph.bps_backend == "htcondor":
+        from .backends.bps import BpsHtcondorBackend
+        bps = BpsHtcondorBackend(bps_dir=bps_dir)
+    elif graph.bps_backend == "parsl":
+        from .backends.bps_parsl import BpsParslBackend
+        bps = BpsParslBackend(bps_dir=bps_dir)
+    else:
+        raise ValueError(f"Unknown bps_backend: {graph.bps_backend!r}")
+
+    return DispatchBackend({"bps": bps, "shell": ShellBackend()})
+
+
 def _require_env(*names: str) -> None:
     missing = [n for n in names if not os.environ.get(n)]
     if missing:
@@ -77,6 +94,7 @@ def submit(workflow_yaml, work_dir, bps_source, instrument,
     click.echo(f"\nWorkflow:   {graph.workflow_id}")
     click.echo(f"Work dir:   {work_dir}")
     click.echo(f"Instrument: {instrument}")
+    click.echo(f"BPS backend: {graph.bps_backend}")
     click.echo(f"\nNodes ({len(graph.nodes)}):")
     for node in graph.nodes:
         deps = f"  <- {node.depends_on}" if node.depends_on else ""
@@ -108,7 +126,6 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
     from .agent import (AgentHandler, InterventionActions,
                         StdoutTransport, WebhookTransport,
                         CallbackTransport)
-    from .backends.bps import BpsHtcondorBackend
     from .bus import EventBus
     from .classifier import ErrorClassifier
     from .code_agent import make_code_agent_callback
@@ -127,7 +144,7 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
     ws.prepare()
 
     bus     = EventBus()
-    backend = BpsHtcondorBackend(bps_dir=ws.bps_dir)
+    backend = _make_backend(graph, ws.bps_dir)
     store   = SqliteStateStore(ws.db_path)
     await store.init()
 
@@ -281,7 +298,6 @@ def intervene_abort(node_id, work_dir, workflow_id, reason):
 async def _intervene(work_dir, workflow_id, action, node_id,
                      reason="", bps_overrides=None):
     from .agent import InterventionActions
-    from .backends.bps import BpsHtcondorBackend
     from .bus import EventBus
 
     db = _db_from_workdir(work_dir)
@@ -302,7 +318,8 @@ async def _intervene(work_dir, workflow_id, action, node_id,
 
     bus     = EventBus()
     _sink   = bus.subscribe("cli_sink")
-    backend = BpsHtcondorBackend(bps_dir=work_dir / "bps")
+    backend = _make_backend(graph, work_dir / "bps")
+    backend.prime_from_graph(graph)
     actions = InterventionActions(
         graph=graph, backend=backend, bus=bus, store=store,
     )
@@ -408,7 +425,6 @@ async def _resume_workflow(work_dir, workflow_id, poll_interval,
                            auto_restart, webhook):
     from .agent import (AgentHandler, InterventionActions,
                         StdoutTransport, WebhookTransport)
-    from .backends.bps import BpsHtcondorBackend
     from .bus import EventBus
     from .classifier import ErrorClassifier
     from .monitor import TimerWakeStrategy
@@ -435,7 +451,7 @@ async def _resume_workflow(work_dir, workflow_id, poll_interval,
     click.echo()
 
     bus     = EventBus()
-    backend = BpsHtcondorBackend(bps_dir=work_dir / "bps")
+    backend = _make_backend(graph, work_dir / "bps")
     patterns_file = work_dir / "error_patterns.yaml"
     classifier = ErrorClassifier(
         patterns_file=patterns_file if patterns_file.exists() else None

@@ -74,6 +74,9 @@ The cluster has one HTCondor schedd per interactive node (e.g. `sdfiana011`–`s
 
 BPS node (default `node_type: bps`):
 ```yaml
+workflow: my_workflow
+bps_backend: htcondor   # "htcondor" (default) or "parsl"
+
 nodes:
   - id: my_new_task
     bps_yaml: bps_myNewTask.yaml
@@ -83,6 +86,7 @@ nodes:
 
 Shell node:
 ```yaml
+workflow: my_workflow
 nodes:
   - id: prep
     node_type: shell
@@ -90,13 +94,21 @@ nodes:
     depends_on: []
 ```
 
-Mixed workflow with `DispatchBackend`:
-```python
-backend = DispatchBackend({
-    "bps":   BpsHtcondorBackend(bps_dir=ws.bps_dir),
-    "shell": ShellBackend(),
-})
+Mixed workflow (shell + BPS via Parsl):
+```yaml
+workflow: my_workflow
+bps_backend: parsl
+
+nodes:
+  - id: prep
+    node_type: shell
+    command: /path/to/prep.sh
+  - id: process
+    bps_yaml: bps_process.yaml
+    depends_on: [prep]
 ```
+
+The CLI always uses `DispatchBackend` internally, routing `node_type: bps` nodes to the selected BPS backend and `node_type: shell` nodes to `ShellBackend`.
 
 ## Adding Custom Error Patterns
 
@@ -140,6 +152,8 @@ batchflow intervene abort  <node_id>
 **Why is `stall_timeout` a constructor parameter, not a class default?** Production runs should never time out waiting for agent intervention. Tests need deterministic completion. Making it explicit prevents accidental timeout in production.
 
 **Why htcondor Python bindings instead of subprocess?** The `htcondor` package provides a typed API with proper exception types (`htcondor.HTCondorException`), no JSON parsing, and — critically — `htcondor.Collector().locate()` enables connecting to a named schedd on any node. The subprocess approach only worked when the agent ran on the same node as the submission.
+
+**Why is `bps_backend` a workflow-level YAML field, not a CLI flag?** The backend choice is a property of the workflow (Parsl workflows require different infrastructure than HTCondor workflows), so it belongs with the workflow definition. It is also persisted in the `StateStore` so `batchflow resume` uses the correct backend automatically without the user needing to re-specify it.
 
 **Why store `submit_location` on `PipelineNode`?** The schedd is determined at submit time (when we know which node we're on). Capturing it then and persisting it with the graph state means the monitor always reconnects to the right schedd, even after a resume on a different node.
 

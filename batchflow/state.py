@@ -264,6 +264,7 @@ def _now() -> str:
 def _serialize_graph(graph: WorkflowGraph) -> str:
     data = {
         "workflow_id": graph.workflow_id,
+        "bps_backend": graph.bps_backend,
         "nodes": [
             {
                 "node_id":         n.node_id,
@@ -287,7 +288,8 @@ def _serialize_graph(graph: WorkflowGraph) -> str:
 
 def _deserialize_graph(json_str: str) -> WorkflowGraph:
     data = json.loads(json_str)
-    graph = WorkflowGraph(data["workflow_id"])
+    graph = WorkflowGraph(data["workflow_id"],
+                          bps_backend=data.get("bps_backend", "htcondor"))
     for nd in data["nodes"]:
         node = PipelineNode(
             node_id   = nd["node_id"],

@@ -103,8 +103,9 @@ class WorkflowGraph:
     [PipelineNode(node_id='read_noise', ...)]
     """
 
-    def __init__(self, workflow_id: str):
+    def __init__(self, workflow_id: str, bps_backend: str = "htcondor"):
         self.workflow_id = workflow_id
+        self.bps_backend = bps_backend
         self._nodes: dict[str, PipelineNode] = {}
 
     # ------------------------------------------------------------------

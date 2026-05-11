@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 from .bps import SubmissionBackend, SubmissionResult
 
 if TYPE_CHECKING:
-    from ..graph import PipelineNode
+    from ..graph import PipelineNode, WorkflowGraph
     from ..bus import EventBus
     from ..monitor import AbstractNodeRunner
 
@@ -107,3 +107,9 @@ class DispatchBackend(SubmissionBackend):
         # Register the new submit_id under the same node_type.
         self._owners[result.submit_id] = self._owners[submit_id]
         return result
+
+    def prime_from_graph(self, graph: "WorkflowGraph") -> None:
+        """Seed _owners from a loaded graph for the intervene/resume case."""
+        for node in graph.nodes:
+            if node.submit_id:
+                self._owners[node.submit_id] = node.node_type
