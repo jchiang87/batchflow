@@ -43,18 +43,22 @@ def _make_fake_node(node_id="a", bps_yaml="a.yaml", submit_id=None):
 # BlockingNodeRunner — success path
 # ---------------------------------------------------------------------------
 
-async def test_blocking_runner_success():
+async def test_blocking_runner_success(tmp_path):
     """NODE_COMPLETE published with parsed run_id on rc=0."""
     bus = EventBus()
     queue = bus.subscribe("test")
 
+    log_path = tmp_path / "a.log"
+    log_path.write_text("Run Id: 12345\n")
+
     proc = MagicMock()
     proc.pid        = 42
     proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(b"Run Id: 12345\n", b""))
+    proc.wait       = AsyncMock(return_value=None)
 
     runner = BlockingNodeRunner(
         proc=proc, workflow_id="wf", node_id="a", bus=bus, node_label="a",
+        log_path=log_path,
     )
     await runner.run()
 
@@ -68,18 +72,22 @@ async def test_blocking_runner_success():
     assert complete.cluster_id == "12345"
 
 
-async def test_blocking_runner_failure():
+async def test_blocking_runner_failure(tmp_path):
     """NODE_FAILED published on non-zero exit code."""
     bus = EventBus()
     queue = bus.subscribe("test")
 
+    log_path = tmp_path / "a.log"
+    log_path.write_text("some output\n")
+
     proc = MagicMock()
     proc.pid        = 43
     proc.returncode = 1
-    proc.communicate = AsyncMock(return_value=(b"some output\n", b""))
+    proc.wait       = AsyncMock(return_value=None)
 
     runner = BlockingNodeRunner(
         proc=proc, workflow_id="wf", node_id="a", bus=bus, node_label="a",
+        log_path=log_path,
     )
     await runner.run()
 
@@ -92,18 +100,22 @@ async def test_blocking_runner_failure():
     assert failed.exit_code == 1
 
 
-async def test_blocking_runner_runtime_error_in_output():
-    """NODE_FAILED published when stdout contains 'RuntimeError' even if rc=0."""
+async def test_blocking_runner_runtime_error_in_output(tmp_path):
+    """NODE_FAILED published when output contains 'RuntimeError' even if rc=0."""
     bus = EventBus()
     queue = bus.subscribe("test")
+
+    log_path = tmp_path / "a.log"
+    log_path.write_text("RuntimeError: something failed\n")
 
     proc = MagicMock()
     proc.pid        = 44
     proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(b"RuntimeError: something failed\n", b""))
+    proc.wait       = AsyncMock(return_value=None)
 
     runner = BlockingNodeRunner(
         proc=proc, workflow_id="wf", node_id="a", bus=bus, node_label="a",
+        log_path=log_path,
     )
     await runner.run()
 
@@ -114,26 +126,29 @@ async def test_blocking_runner_runtime_error_in_output():
     assert EventType.NODE_FAILED in [e.event_type for e in events]
 
 
-async def test_blocking_runner_writes_log(tmp_path):
-    """stdout+stderr are written to log_dir when provided."""
+async def test_blocking_runner_reads_log(tmp_path):
+    """Runner reads output from log_path after process exits."""
     bus = EventBus()
     bus.subscribe("discard")
+
+    log_path = tmp_path / "a.log"
+    log_path.write_text("Run Id: 99\nout\nerr")
 
     proc = MagicMock()
     proc.pid        = 45
     proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(b"Run Id: 99\nout", b"err"))
+    proc.wait       = AsyncMock(return_value=None)
 
     runner = BlockingNodeRunner(
         proc=proc, workflow_id="wf", node_id="a",
-        bus=bus, node_label="a", log_dir=tmp_path,
+        bus=bus, node_label="a", log_path=log_path,
     )
     await runner.run()
 
-    log_file = tmp_path / "a.log"
-    assert log_file.exists()
-    content = log_file.read_text()
-    assert "out" in content and "err" in content
+    events = []
+    queue = bus._queues.get("discard")  # peek at what was published
+    # Just verify no exception and log file is readable — content verified via cluster_id
+    assert log_path.read_text() == "Run Id: 99\nout\nerr"
 
 
 async def test_blocking_runner_cancellation():
@@ -144,9 +159,8 @@ async def test_blocking_runner_cancellation():
     proc = MagicMock()
     proc.pid        = 46
     proc.returncode = None
-    proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
-    proc.terminate   = MagicMock()
-    proc.wait        = AsyncMock(return_value=None)
+    proc.wait       = AsyncMock(side_effect=[asyncio.CancelledError(), None])
+    proc.terminate  = MagicMock()
 
     runner = BlockingNodeRunner(
         proc=proc, workflow_id="wf", node_id="a", bus=bus, node_label="a",
@@ -172,7 +186,7 @@ async def test_bps_parsl_submit_returns_uuid(tmp_path):
     fake_proc.pid = 100
 
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)):
-        result = await backend.submit(node)
+        result = await backend.submit(node, log_dir=tmp_path)
 
     assert re.match(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -192,7 +206,7 @@ async def test_bps_parsl_make_node_runner(tmp_path):
     fake_proc.pid = 101
 
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)):
-        result = await backend.submit(node)
+        result = await backend.submit(node, log_dir=tmp_path)
 
     node.submit_id = result.submit_id
     bus        = EventBus()

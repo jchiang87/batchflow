@@ -5,12 +5,18 @@ ShellBackend runs arbitrary blocking shell commands as workflow nodes.
 Each submit() starts an async subprocess and returns a UUID submit_id.
 restart() re-runs the same command (user is expected to have modified
 the script externally before requesting a restart).
+
+Subprocess output is redirected to a log file (not a PIPE) so that
+proc.wait() returns as soon as the shell process exits, regardless of
+whether any child processes have inherited the write-end of a pipe.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shlex
+import tempfile
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,6 +29,15 @@ if TYPE_CHECKING:
     from ..graph import PipelineNode
 
 log = logging.getLogger(__name__)
+
+
+def _make_log_path(node_id: str, log_dir: Path | None) -> Path:
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return log_dir / f"{node_id}.log"
+    fd, path = tempfile.mkstemp(suffix=f"_{node_id}.log", prefix="batchflow_")
+    os.close(fd)
+    return Path(path)
 
 
 async def _terminate_proc(proc: asyncio.subprocess.Process) -> None:
@@ -40,6 +55,10 @@ async def _terminate_proc(proc: asyncio.subprocess.Process) -> None:
 class ShellNodeRunner(AbstractNodeRunner):
     """
     Awaits a blocking shell subprocess and publishes the terminal node event.
+
+    Uses proc.wait() rather than proc.communicate() so that the runner
+    returns as soon as the shell process exits, regardless of whether child
+    processes have inherited the subprocess's file descriptors.
     """
 
     def __init__(
@@ -49,14 +68,14 @@ class ShellNodeRunner(AbstractNodeRunner):
         node_id:     str,
         bus:         EventBus,
         node_label:  str,
-        log_dir:     Path | None = None,
+        log_path:    Path | None = None,
     ) -> None:
         self._proc        = proc
         self._workflow_id = workflow_id
         self._node_id     = node_id
         self._bus         = bus
         self._node_label  = node_label
-        self._log_dir     = log_dir
+        self._log_path    = log_path
 
     async def run(self) -> None:
         log.info(
@@ -70,7 +89,7 @@ class ShellNodeRunner(AbstractNodeRunner):
         ))
 
         try:
-            stdout_b, stderr_b = await self._proc.communicate()
+            await self._proc.wait()
         except asyncio.CancelledError:
             log.warning(
                 "ShellNodeRunner[%s/%s]: cancelled — terminating subprocess",
@@ -79,14 +98,7 @@ class ShellNodeRunner(AbstractNodeRunner):
             await _terminate_proc(self._proc)
             raise
 
-        rc       = self._proc.returncode
-        stdout   = stdout_b.decode(errors="replace") if stdout_b else ""
-        stderr   = stderr_b.decode(errors="replace") if stderr_b else ""
-        combined = stdout + stderr
-
-        if self._log_dir:
-            self._log_dir.mkdir(parents=True, exist_ok=True)
-            (self._log_dir / f"{self._node_label}.log").write_text(combined)
+        rc = self._proc.returncode
 
         if rc == 0:
             log.info(
@@ -121,9 +133,11 @@ class ShellBackend(SubmissionBackend):
     """
 
     def __init__(self) -> None:
-        self._procs:    dict[str, asyncio.subprocess.Process] = {}
-        self._log_dirs: dict[str, Path | None]                = {}
-        self._commands: dict[str, str]                        = {}
+        self._procs:     dict[str, asyncio.subprocess.Process] = {}
+        self._log_paths: dict[str, Path]                       = {}
+        self._log_dirs:  dict[str, Path | None]                = {}
+        self._commands:  dict[str, str]                        = {}
+        self._node_ids:  dict[str, str]                        = {}
 
     async def submit(
         self,
@@ -138,15 +152,17 @@ class ShellBackend(SubmissionBackend):
         cmd = shlex.split(command)
         log.info("Submitting (shell): %s", command)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        log_path = _make_log_path(node.node_id, log_dir)
+        log_f    = open(log_path, "wb")
+        proc     = await asyncio.create_subprocess_exec(*cmd, stdout=log_f, stderr=log_f)
+        log_f.close()
+
         submit_id = str(uuid.uuid4())
-        self._procs[submit_id]    = proc
-        self._log_dirs[submit_id] = log_dir
-        self._commands[submit_id] = command
+        self._procs[submit_id]     = proc
+        self._log_paths[submit_id] = log_path
+        self._log_dirs[submit_id]  = log_dir
+        self._commands[submit_id]  = command
+        self._node_ids[submit_id]  = node.node_id
 
         log.info("Node %r → %s (pid=%s)", node.node_id, submit_id, proc.pid)
         return SubmissionResult(submit_id=submit_id, submit_location="shell")
@@ -173,7 +189,7 @@ class ShellBackend(SubmissionBackend):
             node_id     = node.node_id,
             bus         = bus,
             node_label  = node.node_id,
-            log_dir     = self._log_dirs.get(submit_id),
+            log_path    = self._log_paths.get(submit_id),
         )
 
     async def release_held(self, submit_id: str) -> None:
@@ -196,19 +212,22 @@ class ShellBackend(SubmissionBackend):
         if not command:
             raise KeyError(f"No command found for submit_id {submit_id!r}")
 
+        node_id = self._node_ids.get(submit_id, submit_id)
         log_dir = self._log_dirs.get(submit_id)
         cmd     = shlex.split(command)
         log.info("Restarting (shell): %s", command)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        log_path = _make_log_path(node_id, log_dir)
+        log_f    = open(log_path, "wb")
+        proc     = await asyncio.create_subprocess_exec(*cmd, stdout=log_f, stderr=log_f)
+        log_f.close()
+
         new_submit_id = str(uuid.uuid4())
-        self._procs[new_submit_id]    = proc
-        self._log_dirs[new_submit_id] = log_dir
-        self._commands[new_submit_id] = command
+        self._procs[new_submit_id]     = proc
+        self._log_paths[new_submit_id] = log_path
+        self._log_dirs[new_submit_id]  = log_dir
+        self._commands[new_submit_id]  = command
+        self._node_ids[new_submit_id]  = node_id
 
         log.info("Restart → %s (pid=%s)", new_submit_id, proc.pid)
         return SubmissionResult(submit_id=new_submit_id, submit_location="shell")

@@ -6,12 +6,19 @@ the workflow completes.  Each submit spawns an async subprocess and returns
 a UUID placeholder as the submit_id.  The real BPS run_id is parsed from the
 output on completion and backfilled into the node via the cluster_id field
 of the NODE_COMPLETE / NODE_FAILED event.
+
+Subprocess output is redirected to a log file (not a PIPE) so that
+proc.wait() returns as soon as the bps submit process exits, regardless of
+whether any child processes (e.g. Parsl workers) have inherited the write-end
+of a pipe and are still alive.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import tempfile
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,6 +38,15 @@ def _parse_run_id(output: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _make_log_path(node_id: str, log_dir: Path | None) -> Path:
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return log_dir / f"{node_id}.log"
+    fd, path = tempfile.mkstemp(suffix=f"_{node_id}.log", prefix="batchflow_")
+    os.close(fd)
+    return Path(path)
+
+
 async def _terminate_proc(proc: asyncio.subprocess.Process) -> None:
     """SIGTERM, then SIGKILL after 10 s if still alive."""
     try:
@@ -47,6 +63,10 @@ class BlockingNodeRunner(AbstractNodeRunner):
     """
     Awaits a blocking subprocess (bps submit with Parsl plugin) and
     publishes the terminal node event when it finishes.
+
+    Uses proc.wait() rather than proc.communicate() so that the runner
+    returns as soon as the bps submit process exits.  Parsl workers that
+    inherit the subprocess's file descriptors cannot block completion.
     """
 
     def __init__(
@@ -56,14 +76,14 @@ class BlockingNodeRunner(AbstractNodeRunner):
         node_id:     str,
         bus:         EventBus,
         node_label:  str,
-        log_dir:     Path | None = None,
+        log_path:    Path | None = None,
     ) -> None:
         self._proc        = proc
         self._workflow_id = workflow_id
         self._node_id     = node_id
         self._bus         = bus
         self._node_label  = node_label
-        self._log_dir     = log_dir
+        self._log_path    = log_path
 
     async def run(self) -> None:
         log.info(
@@ -77,7 +97,7 @@ class BlockingNodeRunner(AbstractNodeRunner):
         ))
 
         try:
-            stdout_b, stderr_b = await self._proc.communicate()
+            await self._proc.wait()
         except asyncio.CancelledError:
             log.warning(
                 "BlockingNodeRunner[%s/%s]: cancelled — terminating subprocess",
@@ -87,15 +107,8 @@ class BlockingNodeRunner(AbstractNodeRunner):
             raise
 
         rc       = self._proc.returncode
-        stdout   = stdout_b.decode(errors="replace") if stdout_b else ""
-        stderr   = stderr_b.decode(errors="replace") if stderr_b else ""
-        combined = stdout + stderr
-
-        if self._log_dir:
-            self._log_dir.mkdir(parents=True, exist_ok=True)
-            (self._log_dir / f"{self._node_label}.log").write_text(combined)
-
-        run_id = _parse_run_id(combined) or ""
+        combined = self._log_path.read_text(errors="replace") if self._log_path else ""
+        run_id   = _parse_run_id(combined) or ""
 
         if rc == 0 and "RuntimeError" not in combined:
             log.info(
@@ -138,9 +151,10 @@ class BpsParslBackend(SubmissionBackend):
     """
 
     def __init__(self, bps_dir: Path) -> None:
-        self._bps_dir   = bps_dir
-        self._procs:    dict[str, asyncio.subprocess.Process] = {}
-        self._log_dirs: dict[str, Path | None]                = {}
+        self._bps_dir    = bps_dir
+        self._procs:     dict[str, asyncio.subprocess.Process] = {}
+        self._log_paths: dict[str, Path]                       = {}
+        self._log_dirs:  dict[str, Path | None]                = {}
 
     async def submit(
         self,
@@ -161,14 +175,15 @@ class BpsParslBackend(SubmissionBackend):
 
         log.info("Submitting (Parsl): %s", " ".join(cmd))
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        log_path = _make_log_path(node.node_id, log_dir)
+        log_f    = open(log_path, "wb")
+        proc     = await asyncio.create_subprocess_exec(*cmd, stdout=log_f, stderr=log_f)
+        log_f.close()
+
         submit_id = str(uuid.uuid4())
-        self._procs[submit_id]    = proc
-        self._log_dirs[submit_id] = log_dir
+        self._procs[submit_id]     = proc
+        self._log_paths[submit_id] = log_path
+        self._log_dirs[submit_id]  = log_dir
 
         log.info("Node %r → placeholder %s (pid=%s)", node.node_id, submit_id, proc.pid)
         return SubmissionResult(submit_id=submit_id, submit_location="parsl")
@@ -195,7 +210,7 @@ class BpsParslBackend(SubmissionBackend):
             node_id     = node.node_id,
             bus         = bus,
             node_label  = node.node_id,
-            log_dir     = self._log_dirs.get(submit_id),
+            log_path    = self._log_paths.get(submit_id),
         )
 
     async def release_held(self, submit_id: str) -> None:
@@ -217,14 +232,15 @@ class BpsParslBackend(SubmissionBackend):
         cmd = ["bps", "restart", "--id", submit_id]
         log.info("Restarting (Parsl): %s", " ".join(cmd))
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        log_path = _make_log_path(submit_id, None)
+        log_f    = open(log_path, "wb")
+        proc     = await asyncio.create_subprocess_exec(*cmd, stdout=log_f, stderr=log_f)
+        log_f.close()
+
         new_submit_id = str(uuid.uuid4())
-        self._procs[new_submit_id]    = proc
-        self._log_dirs[new_submit_id] = None
+        self._procs[new_submit_id]     = proc
+        self._log_paths[new_submit_id] = log_path
+        self._log_dirs[new_submit_id]  = None
 
         log.info("Restart of %r → placeholder %s (pid=%s)", submit_id, new_submit_id, proc.pid)
         return SubmissionResult(submit_id=new_submit_id, submit_location="parsl")

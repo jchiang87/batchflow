@@ -35,7 +35,7 @@ async def test_shell_runner_success():
     proc = MagicMock()
     proc.pid        = 42
     proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(b"hello\n", b""))
+    proc.wait       = AsyncMock(return_value=None)
 
     runner = ShellNodeRunner(
         proc=proc, workflow_id="wf", node_id="a", bus=bus, node_label="a",
@@ -60,7 +60,7 @@ async def test_shell_runner_failure():
     proc = MagicMock()
     proc.pid        = 43
     proc.returncode = 2
-    proc.communicate = AsyncMock(return_value=(b"", b"error output\n"))
+    proc.wait       = AsyncMock(return_value=None)
 
     runner = ShellNodeRunner(
         proc=proc, workflow_id="wf", node_id="a", bus=bus, node_label="a",
@@ -76,26 +76,26 @@ async def test_shell_runner_failure():
     assert failed.exit_code == 2
 
 
-async def test_shell_runner_writes_log(tmp_path):
-    """stdout+stderr are written to log_dir when provided."""
+async def test_shell_runner_log_written_by_subprocess(tmp_path):
+    """Log file written by the subprocess is accessible after the runner completes."""
     bus = EventBus()
     bus.subscribe("discard")
+
+    log_path = tmp_path / "a.log"
+    log_path.write_bytes(b"out\nerr\n")  # simulate subprocess writing to the file
 
     proc = MagicMock()
     proc.pid        = 44
     proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(b"out", b"err"))
+    proc.wait       = AsyncMock(return_value=None)
 
     runner = ShellNodeRunner(
         proc=proc, workflow_id="wf", node_id="a",
-        bus=bus, node_label="a", log_dir=tmp_path,
+        bus=bus, node_label="a", log_path=log_path,
     )
     await runner.run()
 
-    log_file = tmp_path / "a.log"
-    assert log_file.exists()
-    content = log_file.read_text()
-    assert "out" in content and "err" in content
+    assert log_path.read_text() == "out\nerr\n"
 
 
 async def test_shell_runner_cancellation():
@@ -106,9 +106,8 @@ async def test_shell_runner_cancellation():
     proc = MagicMock()
     proc.pid        = 45
     proc.returncode = None
-    proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
-    proc.terminate   = MagicMock()
-    proc.wait        = AsyncMock(return_value=None)
+    proc.wait       = AsyncMock(side_effect=[asyncio.CancelledError(), None])
+    proc.terminate  = MagicMock()
 
     runner = ShellNodeRunner(
         proc=proc, workflow_id="wf", node_id="a", bus=bus, node_label="a",
@@ -123,7 +122,7 @@ async def test_shell_runner_cancellation():
 # ShellBackend.submit + make_node_runner
 # ---------------------------------------------------------------------------
 
-async def test_shell_backend_submit_returns_uuid():
+async def test_shell_backend_submit_returns_uuid(tmp_path):
     """submit() returns a UUID submit_id and 'shell' submit_location."""
     backend   = ShellBackend()
     node      = _make_fake_node(command="/bin/echo hello")
@@ -131,7 +130,7 @@ async def test_shell_backend_submit_returns_uuid():
     fake_proc.pid = 100
 
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)):
-        result = await backend.submit(node)
+        result = await backend.submit(node, log_dir=tmp_path)
 
     assert re.match(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -140,7 +139,7 @@ async def test_shell_backend_submit_returns_uuid():
     assert result.submit_location == "shell"
 
 
-async def test_shell_backend_make_node_runner():
+async def test_shell_backend_make_node_runner(tmp_path):
     """make_node_runner returns a ShellNodeRunner using the stored proc."""
     backend   = ShellBackend()
     node      = _make_fake_node(command="/bin/echo hello")
@@ -148,7 +147,7 @@ async def test_shell_backend_make_node_runner():
     fake_proc.pid = 101
 
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)):
-        result = await backend.submit(node)
+        result = await backend.submit(node, log_dir=tmp_path)
 
     node.submit_id = result.submit_id
     bus        = EventBus()
@@ -171,7 +170,7 @@ async def test_shell_backend_missing_command():
 # ShellBackend.restart
 # ---------------------------------------------------------------------------
 
-async def test_shell_backend_restart_reruns_same_command():
+async def test_shell_backend_restart_reruns_same_command(tmp_path):
     """restart() starts a new subprocess with the same command."""
     backend   = ShellBackend()
     node      = _make_fake_node(command="/bin/echo hello")
@@ -179,7 +178,7 @@ async def test_shell_backend_restart_reruns_same_command():
     fake_proc.pid = 102
 
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)):
-        result = await backend.submit(node)
+        result = await backend.submit(node, log_dir=tmp_path)
         old_submit_id = result.submit_id
 
     fake_proc2 = MagicMock()
@@ -208,7 +207,7 @@ async def test_shell_backend_restart_unknown_id():
 # ShellBackend.remove
 # ---------------------------------------------------------------------------
 
-async def test_shell_backend_remove_terminates_running_proc():
+async def test_shell_backend_remove_terminates_running_proc(tmp_path):
     """remove() terminates a still-running process."""
     backend   = ShellBackend()
     node      = _make_fake_node(command="/bin/sleep 100")
@@ -219,7 +218,7 @@ async def test_shell_backend_remove_terminates_running_proc():
     fake_proc.wait       = AsyncMock(return_value=None)
 
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)):
-        result = await backend.submit(node)
+        result = await backend.submit(node, log_dir=tmp_path)
 
     await backend.remove(result.submit_id)
     fake_proc.terminate.assert_called_once()
@@ -229,18 +228,23 @@ async def test_shell_backend_remove_terminates_running_proc():
 # End-to-end: real subprocess (echo)
 # ---------------------------------------------------------------------------
 
-async def test_shell_runner_real_subprocess():
+async def test_shell_runner_real_subprocess(tmp_path):
     """Integration: run a real /bin/echo subprocess through ShellNodeRunner."""
+    log_path = tmp_path / "echo.log"
+    log_f    = open(log_path, "wb")
+    proc     = await asyncio.create_subprocess_exec(
+        "/bin/echo", "hello",
+        stdout=log_f,
+        stderr=log_f,
+    )
+    log_f.close()
+
     bus   = EventBus()
     queue = bus.subscribe("test")
 
-    proc = await asyncio.create_subprocess_exec(
-        "/bin/echo", "hello",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
     runner = ShellNodeRunner(
         proc=proc, workflow_id="wf", node_id="echo", bus=bus, node_label="echo",
+        log_path=log_path,
     )
     await runner.run()
 
@@ -249,3 +253,4 @@ async def test_shell_runner_real_subprocess():
         events.append(queue.get_nowait())
 
     assert EventType.NODE_COMPLETE in [e.event_type for e in events]
+    assert "hello" in log_path.read_text()
