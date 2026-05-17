@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -46,7 +45,7 @@ async def _make_fixtures(tmp_path, node_id="a", node_state=NodeState.HELD,
 
     interventions = InterventionActions(
         graph=g, backend=backend, bus=bus,
-        store=store, bps_dir=Path("/fake"),
+        store=store,
     )
     return g, bus, backend, store, interventions
 
@@ -220,8 +219,7 @@ async def test_code_agent_runner_concurrent_limit(tmp_path):
         g.node(node_id).state = NodeState.SUBMITTED
 
     interventions = InterventionActions(
-        graph=g, backend=backend, bus=bus,
-        store=store, bps_dir=Path("/fake"),
+        graph=g, backend=backend, bus=bus, store=store,
     )
     interventions.restart_node = slow_restart
 
@@ -276,7 +274,7 @@ async def test_code_agent_runner_ignores_workflow_sentinel(tmp_path):
         restart_count=0,
         max_restarts=0,
         dag_context={},
-        bps_yaml="",
+        node_spec="",
         metadata={},
     )
     await runner.run(notification)

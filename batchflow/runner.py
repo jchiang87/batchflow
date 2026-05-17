@@ -22,13 +22,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from enum import Enum
-from pathlib import Path
+from pathlib import Path  # used by log_dir default
 
 from .agent import AgentHandler
 from .backends.bps import SubmissionBackend, SubmissionResult
 from .bus import EventBus, EventType, JobEvent
 from .graph import NodeState, PipelineNode, WorkflowGraph
-from .monitor import HTCondorMonitor, WakeStrategy
+from .monitor import WakeStrategy
 from .state import StateStore
 
 log = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ class WorkflowRunner:
     backend : SubmissionBackend
     store : StateStore
     bus : EventBus
-    bps_dir : Path
+
     log_dir : Path
     wake_strategy : WakeStrategy | None
     agent_handler : AgentHandler | None
@@ -65,7 +65,6 @@ class WorkflowRunner:
         backend:        SubmissionBackend,
         store:          StateStore,
         bus:            EventBus,
-        bps_dir:        Path,
         log_dir:        Path = Path("./logs"),
         wake_strategy:  WakeStrategy | None = None,
         agent_handler:  AgentHandler | None = None,
@@ -75,7 +74,6 @@ class WorkflowRunner:
         self._backend       = backend
         self._store         = store
         self._bus           = bus
-        self._bps_dir       = bps_dir
         self._log_dir       = log_dir
         self._wake_strategy = wake_strategy
         self._agent_handler = agent_handler
@@ -137,7 +135,7 @@ class WorkflowRunner:
             live.state         = node.state
             live.restart_count = node.restart_count
             live.submit_id     = node.submit_id
-            live.schedd_name   = node.schedd_name
+            live.submit_location = node.submit_location
 
         in_flight = {NodeState.SUBMITTED, NodeState.RUNNING}
         for node in self._graph.nodes:
@@ -169,7 +167,7 @@ class WorkflowRunner:
             old_submit_id      = live.submit_id
             live.state         = node.state
             live.submit_id     = node.submit_id
-            live.schedd_name   = node.schedd_name
+            live.submit_location = node.submit_location
             live.restart_count = node.restart_count
             changed = True
             if (node.state in {NodeState.SUBMITTED, NodeState.RUNNING}
@@ -271,12 +269,16 @@ class WorkflowRunner:
             return
 
         if event.event_type == EventType.NODE_COMPLETE:
+            if event.cluster_id:
+                node.submit_id = event.cluster_id
             node.state = NodeState.SUCCEEDED
             log.info("Node %r succeeded", node_id)
             await self._store.save_workflow(self._graph)
             await self._submit_ready_nodes()
 
         elif event.event_type in {EventType.NODE_FAILED, EventType.NODE_HELD}:
+            if event.cluster_id:
+                node.submit_id = event.cluster_id
             node.state = (
                 NodeState.HELD
                 if event.event_type == EventType.NODE_HELD
@@ -367,35 +369,31 @@ class WorkflowRunner:
 
     async def _submit_node(self, node: PipelineNode) -> None:
         result: SubmissionResult = await self._backend.submit(
-            node.bps_yaml,
-            self._bps_dir,
-            overrides=node.bps_overrides or None,
+            node,
             log_dir=self._log_dir,
         )
-        node.submit_id   = result.cluster_id
-        node.schedd_name = result.schedd_name
+        node.submit_id       = result.submit_id
+        node.submit_location = result.submit_location
         node.state       = NodeState.SUBMITTED
 
         await self._bus.publish(JobEvent(
             event_type  = EventType.JOB_SUBMITTED,
             workflow_id = self._graph.workflow_id,
             node_id     = node.node_id,
-            cluster_id  = result.cluster_id,
+            cluster_id  = result.submit_id,
         ))
 
         self._spawn_monitor(node)
 
     def _spawn_monitor(self, node: PipelineNode) -> None:
-        monitor = HTCondorMonitor(
+        runner = self._backend.make_node_runner(
+            node,
+            self._bus,
+            self._stop_event,
             workflow_id   = self._graph.workflow_id,
-            node_id       = node.node_id,
-            cluster_id    = node.submit_id,
-            bus           = self._bus,
-            schedd_name   = node.schedd_name,
             wake_strategy = self._wake_strategy,
-            stop_event    = self._stop_event,
         )
         task = asyncio.create_task(
-            monitor.run(), name=f"monitor-{node.node_id}"
+            runner.run(), name=f"monitor-{node.node_id}"
         )
         self._monitor_tasks[node.node_id] = task

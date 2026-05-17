@@ -328,7 +328,7 @@ class TestWorkflowRunner:
 
         runner = WorkflowRunner(
             graph=g, backend=backend, store=store,
-            bus=bus, bps_dir=Path("/fake"),
+            bus=bus,
         )
 
         async def inject_completions():
@@ -364,7 +364,7 @@ class TestWorkflowRunner:
 
         runner = WorkflowRunner(
             graph=g, backend=backend, store=store,
-            bus=bus, bps_dir=Path("/fake"),
+            bus=bus,
         )
 
         async def wait_submitted(node_id):
@@ -414,7 +414,7 @@ class TestWorkflowRunner:
         # stall_timeout=0.5: runner exits cleanly after 0.5s stall
         runner = WorkflowRunner(
             graph=g, backend=backend, store=store,
-            bus=bus, bps_dir=Path("/fake"),
+            bus=bus,
             stall_timeout=0.5,
         )
 
@@ -459,12 +459,12 @@ class TestWorkflowRunner:
 
         runner = WorkflowRunner(
             graph=g, backend=backend, store=store,
-            bus=bus, bps_dir=Path("/fake"),
+            bus=bus,
             stall_timeout=5.0,
         )
         actions = InterventionActions(
             graph=g, backend=backend, bus=bus,
-            store=store, bps_dir=Path("/fake"),
+            store=store,
         )
 
         async def wait_submitted(node_id):
@@ -515,12 +515,12 @@ class TestWorkflowRunner:
 
         runner = WorkflowRunner(
             graph=g, backend=backend, store=store,
-            bus=bus, bps_dir=Path("/fake"),
+            bus=bus,
             stall_timeout=5.0,
         )
         actions = InterventionActions(
             graph=g, backend=backend, bus=bus,
-            store=store, bps_dir=Path("/fake"),
+            store=store,
         )
 
         monitor_spawned = asyncio.Event()
@@ -544,9 +544,9 @@ class TestWorkflowRunner:
             await actions.restart_node("a", reason="test")
             await asyncio.sleep(0.1)
 
-            # A new cluster_id must have been assigned
+            # A new submit_id must have been assigned
             assert g.node("a").submit_id != first_cluster, \
-                "restart_node should have submitted a new cluster"
+                "restart_node should have assigned a new submit_id"
 
             # A monitor task must now exist for the new cluster
             task = runner._monitor_tasks.get("a")
@@ -634,7 +634,7 @@ class TestInterventionActions:
 
         actions = InterventionActions(
             graph=g, backend=backend, bus=bus,
-            store=store, bps_dir=Path("/fake"),
+            store=store,
         )
         await actions.restart_node("a", reason="test restart")
         assert g.node("a").restart_count == 1
@@ -656,7 +656,7 @@ class TestInterventionActions:
 
         actions = InterventionActions(
             graph=g, backend=backend, bus=bus,
-            store=store, bps_dir=Path("/fake"),
+            store=store,
         )
         with pytest.raises(RuntimeError, match="not restartable"):
             await actions.restart_node("a")
@@ -677,7 +677,7 @@ class TestInterventionActions:
 
         actions = InterventionActions(
             graph=g, backend=backend, bus=bus,
-            store=store, bps_dir=Path("/fake"),
+            store=store,
         )
         await actions.skip_node("a", reason="skipping for test")
         assert g.node("a").state == NodeState.SKIPPED
@@ -701,7 +701,7 @@ class TestInterventionActions:
 
         actions = InterventionActions(
             graph=g, backend=backend, bus=bus,
-            store=store, bps_dir=Path("/fake"),
+            store=store,
         )
         await actions.abort_node("a", reason="testing abort")
         assert g.node("a").state == NodeState.FAILED
@@ -734,7 +734,7 @@ class TestAgentNotification:
             restart_count=1,
             max_restarts=3,
             dag_context={"a": "HELD", "b": "PENDING"},
-            bps_yaml="bps_a.yaml",
+            node_spec="bps_a.yaml",
             metadata={},
         )
         raw = notif.to_json()

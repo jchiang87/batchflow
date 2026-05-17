@@ -1,11 +1,10 @@
 """
 backends/bps.py — SubmissionBackend ABC and concrete implementations.
 
-BpsBackend    — shells out to ``bps submit``, parses the cluster ID,
-                and returns it.  This replaces the subprocess logic
-                scattered across EoPipelines and CpPipelines.
+BpsHtcondorBackend — shells out to ``bps submit`` (HTCondor plugin),
+                     parses the cluster ID, and returns it.
 
-MockBackend   — in-process fake for unit tests; never touches HTCondor.
+MockBackend        — in-process fake for unit tests.
 """
 from __future__ import annotations
 
@@ -16,6 +15,12 @@ import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..graph import PipelineNode
+    from ..monitor import AbstractNodeRunner
+    from ..bus import EventBus
 
 log = logging.getLogger(__name__)
 
@@ -31,15 +36,15 @@ class SubmissionResult:
 
     Attributes
     ----------
-    cluster_id : str
-        The HTCondor cluster ID, e.g. ``"12345"``.
-    schedd_name : str
-        FQDN of the schedd that accepted the submission (e.g.
-        ``"sdfiana032.sdf.slac.stanford.edu"``).  Empty string when
-        the schedd name could not be determined.
+    submit_id : str
+        Opaque identifier for the submitted job (e.g. an HTCondor cluster
+        ID or a UUID).  Used by the backend to reconnect on resume/restart.
+    submit_location : str
+        Backend-specific location hint (e.g. schedd FQDN for HTCondor,
+        ``"parsl"`` for Parsl).  Empty string when not applicable.
     """
-    cluster_id:  str
-    schedd_name: str
+    submit_id:       str
+    submit_location: str
 
 
 # ---------------------------------------------------------------------------
@@ -54,73 +59,98 @@ class SubmissionBackend(ABC):
     @abstractmethod
     async def submit(
         self,
-        bps_yaml: str,
-        bps_dir: Path,
-        overrides: dict[str, str] | None = None,
+        node: "PipelineNode",
+        *,
         log_dir: Path | None = None,
     ) -> SubmissionResult:
         """
-        Submit the pipeline described by *bps_yaml*.
+        Submit the job described by *node*.
 
         Parameters
         ----------
-        bps_yaml : str
-            Filename within *bps_dir*, e.g. ``"bps_eoReadNoise.yaml"``.
-        bps_dir : Path
-            Directory that contains the BPS YAML files (the local ./bps/).
-        overrides : dict | None
-            Optional key=value pairs forwarded to bps as
-            ``--override key=value`` arguments.
+        node : PipelineNode
+            The node to submit.  Backends extract whatever they need
+            (e.g. ``node.bps_yaml`` / ``node.overrides`` for BPS backends,
+            ``node.command`` for shell backends).
         log_dir : Path | None
-            If given, stdout+stderr of bps submit are captured here.
+            If given, stdout+stderr are captured here.
 
         Returns
         -------
         SubmissionResult
-            Dataclass with cluster_id and schedd_name.
+            Dataclass with submit_id and submit_location.
         """
 
     @abstractmethod
-    async def release_held(self, cluster_id: str) -> None:
-        """Run ``condor_release <cluster_id>`` to un-hold held jobs."""
+    async def release_held(self, submit_id: str) -> None:
+        """Release a paused/held job identified by *submit_id*."""
 
     @abstractmethod
-    async def remove(self, cluster_id: str) -> None:
-        """Run ``condor_rm <cluster_id>`` to abort all jobs in the cluster."""
+    async def remove(self, submit_id: str) -> None:
+        """Abort all jobs associated with *submit_id*."""
 
     @abstractmethod
-    async def restart(self, cluster_id: str) -> SubmissionResult:
-        """Run ``bps restart --id <cluster_id>`` and return the new SubmissionResult."""
+    async def restart(self, submit_id: str) -> SubmissionResult:
+        """Restart a failed/held job and return the new SubmissionResult."""
+
+    @abstractmethod
+    def make_node_runner(
+        self,
+        node: "PipelineNode",
+        bus: "EventBus",
+        stop_event: asyncio.Event,
+        *,
+        workflow_id: str = "",
+        wake_strategy: object = None,
+    ) -> "AbstractNodeRunner":
+        """
+        Return an AbstractNodeRunner that will monitor *node* until it
+        reaches a terminal state, publishing events to *bus*.
+        Run the returned object as an asyncio Task.
+
+        *workflow_id* and *wake_strategy* are forwarded to backends that
+        need them (e.g. HTCondor); blocking backends may ignore them.
+        """
 
 
 # ---------------------------------------------------------------------------
 # BPS implementation
 # ---------------------------------------------------------------------------
 
-class BpsBackend(SubmissionBackend):
+class BpsHtcondorBackend(SubmissionBackend):
     """
-    Submits via ``bps submit`` and parses the cluster / submit-dir from
-    its stdout.
+    Submits via ``bps submit`` (HTCondor plugin) and parses the cluster ID
+    from its stdout.
 
     BPS failures are detected by checking for ``RuntimeError`` in the
     captured log (the same approach as the original code, since piping
     through ``tee`` swallows the non-zero exit code).  Once BPS exposes
     a machine-readable exit code this check can be simplified.
+
+    Parameters
+    ----------
+    bps_dir : Path
+        Directory that contains the BPS YAML files (the local ./bps/).
     """
+
+    def __init__(self, bps_dir: Path) -> None:
+        self._bps_dir = bps_dir
 
     async def submit(
         self,
-        bps_yaml: str,
-        bps_dir: Path,
-        overrides: dict[str, str] | None = None,
+        node: "PipelineNode",
+        *,
         log_dir: Path | None = None,
     ) -> SubmissionResult:
-        yaml_path = bps_dir / bps_yaml
+        bps_yaml = node.bps_yaml
+        if not bps_yaml:
+            raise ValueError(f"Node {node.node_id!r} has no bps_yaml set")
+        yaml_path = self._bps_dir / bps_yaml
         if not yaml_path.exists():
             raise FileNotFoundError(f"BPS YAML not found: {yaml_path}")
 
         cmd = ["bps", "submit", str(yaml_path)]
-        for key, val in (overrides or {}).items():
+        for key, val in (node.overrides or {}).items():
             cmd += ["--override", f"{key}={val}"]
 
         log.info("Submitting: %s", " ".join(cmd))
@@ -142,7 +172,7 @@ class BpsBackend(SubmissionBackend):
                 + stdout[-2000:]  # tail to keep logs manageable
             )
 
-        cluster_id = self._parse_cluster_id(stdout)
+        submit_id = self._parse_cluster_id(stdout)
 
         # Capture the local schedd FQDN so the monitor can reconnect to it
         # when running on a different node.  The FQDN lives in the alias
@@ -150,13 +180,13 @@ class BpsBackend(SubmissionBackend):
         try:
             import htcondor
             m = re.search(r'alias=([^>&]+)', htcondor.Schedd().location.address)
-            schedd_name = m.group(1) if m else ""
+            submit_location = m.group(1) if m else ""
         except Exception:
-            schedd_name = ""
+            submit_location = ""
 
         log.info("Submitted %s → cluster %s on schedd %s",
-                 bps_yaml, cluster_id, schedd_name)
-        return SubmissionResult(cluster_id=cluster_id, schedd_name=schedd_name)
+                 bps_yaml, submit_id, submit_location)
+        return SubmissionResult(submit_id=submit_id, submit_location=submit_location)
 
     @staticmethod
     def _run_bps(cmd: list[str]) -> tuple[str, str]:
@@ -188,32 +218,52 @@ class BpsBackend(SubmissionBackend):
             "Output was:\n" + output[-1000:]
         )
 
-    async def release_held(self, cluster_id: str) -> None:
-        await self._run_condor(["condor_release", cluster_id])
+    async def release_held(self, submit_id: str) -> None:
+        await self._run_condor(["condor_release", submit_id])
 
-    async def remove(self, cluster_id: str) -> None:
-        await self._run_condor(["condor_rm", cluster_id])
+    async def remove(self, submit_id: str) -> None:
+        await self._run_condor(["condor_rm", submit_id])
 
-    async def restart(self, cluster_id: str) -> SubmissionResult:
-        cmd = ["bps", "restart", "--id", cluster_id]
+    async def restart(self, submit_id: str) -> SubmissionResult:
+        cmd = ["bps", "restart", "--id", submit_id]
         log.info("Restarting: %s", " ".join(cmd))
         loop = asyncio.get_running_loop()
         stdout, stderr = await loop.run_in_executor(None, self._run_bps, cmd)
         if "RuntimeError" in stdout or "RuntimeError" in stderr:
             raise RuntimeError(
-                f"bps restart reported RuntimeError for cluster {cluster_id}:\n"
+                f"bps restart reported RuntimeError for {submit_id}:\n"
                 + stdout[-2000:]
             )
-        new_cluster_id = self._parse_cluster_id(stdout)
+        new_submit_id = self._parse_cluster_id(stdout)
         try:
             import htcondor
             m = re.search(r'alias=([^>&]+)', htcondor.Schedd().location.address)
-            schedd_name = m.group(1) if m else ""
+            submit_location = m.group(1) if m else ""
         except Exception:
-            schedd_name = ""
-        log.info("Restarted cluster %s → new cluster %s on schedd %s",
-                 cluster_id, new_cluster_id, schedd_name)
-        return SubmissionResult(cluster_id=new_cluster_id, schedd_name=schedd_name)
+            submit_location = ""
+        log.info("Restarted %s → new cluster %s on schedd %s",
+                 submit_id, new_submit_id, submit_location)
+        return SubmissionResult(submit_id=new_submit_id, submit_location=submit_location)
+
+    def make_node_runner(
+        self,
+        node: "PipelineNode",
+        bus: "EventBus",
+        stop_event: asyncio.Event,
+        *,
+        workflow_id: str = "",
+        wake_strategy: object = None,
+    ) -> "AbstractNodeRunner":
+        from ..monitor import HTCondorNodeRunner
+        return HTCondorNodeRunner(
+            workflow_id   = workflow_id,
+            node_id       = node.node_id,
+            cluster_id    = node.submit_id,
+            bus           = bus,
+            schedd_name   = node.submit_location,
+            wake_strategy = wake_strategy,
+            stop_event    = stop_event,
+        )
 
     @staticmethod
     async def _run_condor(cmd: list[str]) -> None:
@@ -231,6 +281,9 @@ class BpsBackend(SubmissionBackend):
 # Mock implementation — for tests and dry-runs
 # ---------------------------------------------------------------------------
 
+BpsBackend = BpsHtcondorBackend  # backward-compatibility alias
+
+
 class MockBackend(SubmissionBackend):
     """
     In-process backend that never touches HTCondor.
@@ -245,37 +298,62 @@ class MockBackend(SubmissionBackend):
 
     async def submit(
         self,
-        bps_yaml: str,
-        bps_dir: Path,
-        overrides: dict[str, str] | None = None,
+        node: "PipelineNode",
+        *,
         log_dir: Path | None = None,
     ) -> SubmissionResult:
-        cluster_id = str(self._next_id)
+        submit_id = str(self._next_id)
         self._next_id += 1
         record = {
-            "cluster_id":  cluster_id,
-            "schedd_name": "mock-schedd",
-            "bps_yaml":    bps_yaml,
-            "overrides":   overrides or {},
+            "submit_id":       submit_id,
+            "submit_location": "mock-schedd",
+            "node_id":         node.node_id,
+            "node_type":       node.node_type,
+            "overrides":       node.overrides,
         }
         self.submitted.append(record)
-        log.info("MockBackend: submit %s → cluster %s", bps_yaml, cluster_id)
-        return SubmissionResult(cluster_id=cluster_id, schedd_name="mock-schedd")
+        log.info("MockBackend: submit %r → %s", node.node_id, submit_id)
+        return SubmissionResult(submit_id=submit_id, submit_location="mock-schedd")
 
-    async def release_held(self, cluster_id: str) -> None:
-        log.info("MockBackend: release_held %s", cluster_id)
+    async def release_held(self, submit_id: str) -> None:
+        log.info("MockBackend: release_held %s", submit_id)
 
-    async def remove(self, cluster_id: str) -> None:
-        log.info("MockBackend: remove %s", cluster_id)
+    async def remove(self, submit_id: str) -> None:
+        log.info("MockBackend: remove %s", submit_id)
 
-    async def restart(self, cluster_id: str) -> SubmissionResult:
-        new_cluster_id = str(self._next_id)
+    async def restart(self, submit_id: str) -> SubmissionResult:
+        new_submit_id = str(self._next_id)
         self._next_id += 1
         record = {
-            "cluster_id":     new_cluster_id,
-            "schedd_name":    "mock-schedd",
-            "restarted_from": cluster_id,
+            "submit_id":       new_submit_id,
+            "submit_location": "mock-schedd",
+            "restarted_from":  submit_id,
         }
         self.submitted.append(record)
-        log.info("MockBackend: restart %s → cluster %s", cluster_id, new_cluster_id)
-        return SubmissionResult(cluster_id=new_cluster_id, schedd_name="mock-schedd")
+        log.info("MockBackend: restart %s → %s", submit_id, new_submit_id)
+        return SubmissionResult(submit_id=new_submit_id, submit_location="mock-schedd")
+
+    def make_node_runner(
+        self,
+        node: "PipelineNode",
+        bus: "EventBus",
+        stop_event: asyncio.Event,
+        *,
+        workflow_id: str = "",
+        wake_strategy: object = None,
+    ) -> "AbstractNodeRunner":
+        return _MockNodeRunner(stop_event)
+
+
+class _MockNodeRunner:
+    """
+    Node runner for MockBackend.  Waits on stop_event so the task stays
+    alive (like a real monitor) until the runner shuts down.  Tests drive
+    outcomes by injecting events directly onto the bus.
+    """
+
+    def __init__(self, stop_event: asyncio.Event) -> None:
+        self._stop_event = stop_event
+
+    async def run(self) -> None:
+        await self._stop_event.wait()

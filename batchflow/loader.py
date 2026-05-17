@@ -4,22 +4,25 @@ loader.py — Load WorkflowGraph from YAML or build programmatically.
 YAML format
 -----------
     workflow: b_protocol
+    bps_backend: htcondor               # "htcondor" (default) or "parsl"
 
     nodes:
-      - id: read_noise
-        bps_yaml: bps_eoReadNoise.yaml
-        max_restarts: 5             # optional, default 3
+      - id: prep
+        node_type: shell                # "bps" (default) or "shell"
+        command: /path/to/prep.sh
 
-      - id: ptc
-        bps_yaml: bps_cpPtc.yaml
-        depends_on: [read_noise]
+      - id: read_noise
+        node_type: bps                  # optional; "bps" is the default
+        bps_yaml: bps_eoReadNoise.yaml
+        depends_on: [prep]
+        max_restarts: 5                 # optional, default 3
 
       - id: linearity
-        bps_yaml: bps_eoLinearity.yaml
-        depends_on: [ptc]
-        bps_overrides:              # optional key=value pairs for bps
+        bps_yaml: bps_eoLinearity.yaml  # node_type: bps implied
+        depends_on: [read_noise]
+        overrides:                      # optional key=value pairs for bps
           requestMemory: "8G"
-        metadata:                   # arbitrary user data
+        metadata:                       # arbitrary user data
           description: "Linearity curves from flat pairs"
 """
 from __future__ import annotations
@@ -54,21 +57,41 @@ def load_workflow(path: str | Path) -> WorkflowGraph:
     if "nodes" not in data or not data["nodes"]:
         raise ValueError("Workflow YAML must contain at least one node")
 
-    graph = WorkflowGraph(data["workflow"])
+    _VALID_BPS_BACKENDS = {"htcondor", "parsl"}
+    bps_backend = data.get("bps_backend", "htcondor")
+    if bps_backend not in _VALID_BPS_BACKENDS:
+        raise ValueError(
+            f"bps_backend {bps_backend!r} must be one of "
+            f"{sorted(_VALID_BPS_BACKENDS)}"
+        )
+
+    graph = WorkflowGraph(data["workflow"], bps_backend=bps_backend)
 
     for nd in data["nodes"]:
         if "id" not in nd:
             raise ValueError(f"Node entry missing 'id': {nd}")
-        if "bps_yaml" not in nd:
-            raise ValueError(f"Node {nd['id']!r} missing 'bps_yaml'")
+
+        node_type = nd.get("node_type", "bps")
+
+        if node_type == "shell":
+            if "command" not in nd:
+                raise ValueError(f"Node {nd['id']!r} has node_type 'shell' but no 'command'")
+        else:
+            if "bps_yaml" not in nd:
+                raise ValueError(f"Node {nd['id']!r} missing 'bps_yaml'")
+
+        # Accept both "overrides" and the legacy "bps_overrides" key.
+        overrides = nd.get("overrides", nd.get("bps_overrides", {}))
 
         node = PipelineNode(
-            node_id       = nd["id"],
-            bps_yaml      = nd["bps_yaml"],
-            depends_on    = nd.get("depends_on", []),
-            bps_overrides = nd.get("bps_overrides", {}),
-            max_restarts  = nd.get("max_restarts", 3),
-            metadata      = nd.get("metadata", {}),
+            node_id      = nd["id"],
+            bps_yaml     = nd.get("bps_yaml"),
+            node_type    = node_type,
+            command      = nd.get("command"),
+            depends_on   = nd.get("depends_on", []),
+            overrides    = overrides,
+            max_restarts = nd.get("max_restarts", 3),
+            metadata     = nd.get("metadata", {}),
         )
         graph.add_node(node)
 
