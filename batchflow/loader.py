@@ -15,7 +15,7 @@ YAML format
         node_type: bps                  # optional; "bps" is the default
         bps_yaml: bps_eoReadNoise.yaml
         depends_on: [prep]
-        max_restarts: 5                 # optional, default 3
+        max_restarts: 5                 # optional, default 1
 
       - id: linearity
         bps_yaml: bps_eoLinearity.yaml  # node_type: bps implied
@@ -90,7 +90,7 @@ def load_workflow(path: str | Path) -> WorkflowGraph:
             command      = nd.get("command"),
             depends_on   = nd.get("depends_on", []),
             overrides    = overrides,
-            max_restarts = nd.get("max_restarts", 3),
+            max_restarts = nd.get("max_restarts", 1),
             metadata     = nd.get("metadata", {}),
         )
         graph.add_node(node)
