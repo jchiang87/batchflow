@@ -14,12 +14,26 @@ import asyncio
 import logging
 import os
 import sys
+import glob
 from pathlib import Path
 
 import click
 
 from .loader import load_workflow
 from .state import SqliteStateStore
+
+
+def _get_work_dir(work_dir: Path) -> Path:
+    if work_dir is None:
+        return Path(sorted(glob.glob("./runs/*"))[-1])
+    return Path(work_dir)
+
+
+def _get_next_work_dir(work_dir: Path) -> Path:
+    if work_dir is None:
+        paths = sorted(glob.glob("./runs/[0-9]*"))
+        return Path(f"./runs/{len(paths):03d}")
+    return Path(work_dir)
 
 
 def _db_from_workdir(work_dir: Path) -> Path:
@@ -46,7 +60,8 @@ def _make_backend(graph, bps_dir: Path):
 def _require_env(*names: str) -> None:
     missing = [n for n in names if not os.environ.get(n)]
     if missing:
-        click.echo(click.style(f"Missing env vars: {missing}", fg="red"), err=True)
+        click.echo(click.style(f"Missing env vars: {missing}", fg="red"),
+                   err=True)
         sys.exit(1)
 
 
@@ -74,7 +89,7 @@ def cli(log_level):
 
 @cli.command()
 @click.argument("workflow_yaml", type=click.Path(exists=True))
-@click.option("--work-dir", "-w", default=".", show_default=True)
+@click.option("--work-dir", "-w", default=None, show_default=True)
 @click.option("--bps-source", envvar="EO_PIPE_DIR")
 @click.option("--instrument", envvar="INSTRUMENT_NAME", default="LSSTCam",
               show_default=True)
@@ -88,7 +103,7 @@ def cli(log_level):
 def submit(workflow_yaml, work_dir, bps_source, instrument,
            poll_interval, dry_run, no_confirm, auto_restart, webhook):
     """Load WORKFLOW_YAML and execute the workflow."""
-    work_dir = Path(work_dir)
+    work_dir = _get_next_work_dir(work_dir)
     graph = load_workflow(workflow_yaml)
 
     click.echo(f"\nWorkflow:   {graph.workflow_id}")
@@ -143,9 +158,9 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
     )
     ws.prepare()
 
-    bus     = EventBus()
+    bus = EventBus()
     backend = _make_backend(graph, ws.bps_dir)
-    store   = SqliteStateStore(ws.db_path)
+    store = SqliteStateStore(ws.db_path)
     await store.init()
 
     patterns_file = work_dir / "error_patterns.yaml"
@@ -186,11 +201,12 @@ async def _run_workflow(graph, work_dir, bps_source, instrument,
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--work-dir", "-w", default=".", show_default=True)
+@click.option("--work-dir", "-w", default=None, show_default=True)
 @click.option("--workflow-id", default=None)
 def status(work_dir, workflow_id):
     """Print current node states from the StateStore."""
-    asyncio.run(_print_status(Path(work_dir), workflow_id))
+    work_dir = _get_work_dir(work_dir)
+    asyncio.run(_print_status(work_dir, workflow_id))
 
 
 async def _print_status(work_dir: Path, workflow_id: str | None):
@@ -229,7 +245,7 @@ async def _print_status(work_dir: Path, workflow_id: str | None):
         state_s = (click.style(f"{node.state.value:<12}", fg=color)
                    if color else f"{node.state.value:<12}")
         restarts = f"{node.restart_count}/{node.max_restarts}"
-        cluster  = node.submit_id or "-"
+        cluster = node.submit_id or "-"
         click.echo(f"{node.node_id:<30} {state_s} {restarts:<10} {cluster}")
 
     click.echo()
@@ -250,48 +266,52 @@ def intervene():
 
 @intervene.command("restart")
 @click.argument("node_id")
-@click.option("--work-dir", "-w", default=".", show_default=True)
+@click.option("--work-dir", "-w", default=None, show_default=True)
 @click.option("--workflow-id", default=None)
 @click.option("--reason", default="manual restart via CLI")
 def intervene_restart(node_id, work_dir, workflow_id, reason):
     """Restart a held or failed node via bps restart."""
-    asyncio.run(_intervene(Path(work_dir), workflow_id,
+    work_dir = _get_work_dir(work_dir)
+    asyncio.run(_intervene(work_dir, workflow_id,
                            "restart", node_id, reason))
 
 
 @intervene.command("resubmit")
 @click.argument("node_id")
-@click.option("--work-dir", "-w", default=".", show_default=True)
+@click.option("--work-dir", "-w", default=None, show_default=True)
 @click.option("--workflow-id", default=None)
 @click.option("--reason", default="manual resubmit via CLI")
 @click.option("--override", "-o", multiple=True,
               help="BPS override as key=value.")
 def intervene_resubmit(node_id, work_dir, workflow_id, reason, override):
     """Submit a failed node from scratch via bps submit."""
+    work_dir = _get_work_dir(work_dir)
     overrides = dict(kv.split("=", 1) for kv in override)
-    asyncio.run(_intervene(Path(work_dir), workflow_id,
+    asyncio.run(_intervene(work_dir, workflow_id,
                            "resubmit", node_id, reason, overrides))
 
 
 @intervene.command("skip")
 @click.argument("node_id")
-@click.option("--work-dir", "-w", default=".", show_default=True)
+@click.option("--work-dir", "-w", default=None, show_default=True)
 @click.option("--workflow-id", default=None)
 @click.option("--reason", default="manual skip via CLI")
 def intervene_skip(node_id, work_dir, workflow_id, reason):
     """Skip a node and unblock its dependents."""
-    asyncio.run(_intervene(Path(work_dir), workflow_id,
+    work_dir = _get_work_dir(work_dir)
+    asyncio.run(_intervene(work_dir, workflow_id,
                            "skip", node_id, reason))
 
 
 @intervene.command("abort")
 @click.argument("node_id")
-@click.option("--work-dir", "-w", default=".", show_default=True)
+@click.option("--work-dir", "-w", default=None, show_default=True)
 @click.option("--workflow-id", default=None)
 @click.option("--reason", default="manual abort via CLI")
 def intervene_abort(node_id, work_dir, workflow_id, reason):
     """Abort a node's HTCondor jobs and mark it failed."""
-    asyncio.run(_intervene(Path(work_dir), workflow_id,
+    work_dir = _get_work_dir(work_dir)
+    asyncio.run(_intervene(work_dir, workflow_id,
                            "abort", node_id, reason))
 
 
@@ -316,8 +336,8 @@ async def _intervene(work_dir, workflow_id, action, node_id,
         click.echo(f"Workflow {workflow_id!r} not found.", err=True)
         sys.exit(1)
 
-    bus     = EventBus()
-    _sink   = bus.subscribe("cli_sink")
+    bus = EventBus()
+    # _sink = bus.subscribe("cli_sink")
     backend = _make_backend(graph, work_dir / "bps")
     backend.prime_from_graph(graph)
     actions = InterventionActions(
@@ -349,10 +369,11 @@ async def _intervene(work_dir, workflow_id, action, node_id,
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--work-dir", "-w", default=".", show_default=True)
+@click.option("--work-dir", "-w", default=None, show_default=True)
 def workflows(work_dir):
     """List all workflows in the StateStore."""
-    asyncio.run(_list_workflows(Path(work_dir)))
+    work_dir = _get_work_dir(work_dir)
+    asyncio.run(_list_workflows(work_dir))
 
 
 async def _list_workflows(work_dir: Path):
@@ -389,7 +410,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--work-dir", "-w", default=".", show_default=True,
+@click.option("--work-dir", "-w", default=None, show_default=True,
               help="Working directory of the original run.")
 @click.option("--workflow-id", default=None,
               help="Workflow ID to resume (defaults to most recent).")
@@ -407,10 +428,11 @@ def resume(work_dir, workflow_id, poll_interval, auto_restart, webhook):
     SUCCEEDED nodes are not re-submitted.  HELD/FAILED nodes remain in
     that state until the agent intervenes (or --auto-restart is set).
     """
-    work_dir = Path(work_dir)
+    work_dir = _get_work_dir(work_dir)
     db = _db_from_workdir(work_dir)
     if not db.exists():
-        click.echo(click.style(f"No state database at {db}", fg="red"), err=True)
+        click.echo(click.style(f"No state database at {db}", fg="red"),
+                   err=True)
         sys.exit(1)
     asyncio.run(_resume_workflow(
         work_dir=work_dir,
@@ -450,7 +472,7 @@ async def _resume_workflow(work_dir, workflow_id, poll_interval,
         click.echo(f"  {state}: {count}")
     click.echo()
 
-    bus     = EventBus()
+    bus = EventBus()
     backend = _make_backend(graph, work_dir / "bps")
     patterns_file = work_dir / "error_patterns.yaml"
     classifier = ErrorClassifier(
